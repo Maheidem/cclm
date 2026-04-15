@@ -169,8 +169,8 @@ while (( $# )); do
   shift
 done
 
-# Try to load last session
-load_last_session
+# Try to load last session (return 1 is normal on first run — no state file yet).
+load_last_session || true
 
 if [[ -z "$backend" ]]; then
   echo "" >&2
@@ -1107,7 +1107,7 @@ run_zai() {
     fi
   fi
 
-  # --- 3. Load saved values (defaults for prompts) ---
+  # --- 3. Load saved values ---
   local d_base_url="" d_opus="" d_sonnet="" d_haiku=""
   local d_ctx="200000" d_timeout_ms="3000000"
   if [[ -f "$profile" ]]; then
@@ -1125,137 +1125,167 @@ run_zai() {
     d_timeout_ms=$(jq -r '.api_timeout_ms // 3000000' "$profile")
   fi
 
-  # --- 4. Base URL (always prompt — user asked to choose per launch) ---
-  echo "" >&2
-  echo "Base URL:" >&2
-  echo "  1) https://api.z.ai/api/anthropic        (official Claude Code endpoint — recommended)" >&2
-  echo "  2) https://api.z.ai/api/coding/paas/v4   (Coding Plan subscription, OpenAI protocol)" >&2
-  echo "  3) Custom" >&2
-  local url_default_hint="1"
-  [[ -n "$d_base_url" ]] && url_default_hint="current: $d_base_url"
-  printf "Choice [%s]: " "$url_default_hint" >&2
-  local uchoice base_url
-  read -r uchoice
-  case "${uchoice:-}" in
-    1) base_url="https://api.z.ai/api/anthropic" ;;
-    2) base_url="https://api.z.ai/api/coding/paas/v4" ;;
-    3) base_url="$(ask 'Custom base URL' "${d_base_url:-https://api.z.ai/api/anthropic}")" ;;
-    "") base_url="${d_base_url:-https://api.z.ai/api/anthropic}" ;;
-    *)  echo "Invalid selection." >&2; exit 1 ;;
-  esac
-
-  # --- 5. Per-tier model selection ---
-  # Fetch live model list from Z.ai's OpenAI-compat /models endpoint
-  # (the anthropic-compat endpoint doesn't expose one). Same API key works.
-  echo "" >&2
-  echo "Fetching model list from Z.ai..." >&2
-  local models_json
-  models_json="$(curl -sf --max-time 10 \
-    -H "Authorization: Bearer $ZAI_API_KEY" \
-    "https://api.z.ai/api/paas/v4/models" 2>/dev/null || echo '')"
-
-  local -a model_ids
-  if [[ -n "$models_json" ]] && echo "$models_json" | jq -e '.data' >/dev/null 2>&1; then
-    model_ids=( "${(f)$(echo "$models_json" | jq -r '.data[].id' | sort -u)}" )
-  else
-    echo "  (/models fetch failed — using built-in list)" >&2
-    model_ids=( glm-4.5 glm-4.5-air glm-4.6 glm-4.7 )
+  # --- 3b. Use saved profile as-is? (skip all prompts if yes) ---
+  local use_saved=false
+  if [[ -f "$profile" && -n "$d_base_url" && -n "$d_opus" && -n "$d_sonnet" && -n "$d_haiku" ]]; then
+    echo "" >&2
+    echo "Saved profile:" >&2
+    printf "  %-13s %s\n" "Base URL:" "$d_base_url"     >&2
+    printf "  %-13s %s\n" "Opus:"     "$d_opus"         >&2
+    printf "  %-13s %s\n" "Sonnet:"   "$d_sonnet"       >&2
+    printf "  %-13s %s\n" "Haiku:"    "$d_haiku"        >&2
+    printf "  %-13s %s\n" "Context:"  "$d_ctx"          >&2
+    printf "  %-13s %s\n" "Timeout:"  "$d_timeout_ms"   >&2
+    echo "" >&2
+    printf "Use saved profile? (Y/n): " >&2
+    local _use_reply
+    read -r _use_reply
+    [[ -z "$_use_reply" || "$_use_reply" =~ ^[Yy]$ ]] && use_saved=true
   fi
 
-  # Heuristic defaults: Opus → glm-4.7 if present, Haiku → a *-air variant if present.
-  local opus_default="${model_ids[1]}" haiku_default="${model_ids[${#model_ids[@]}]}"
-  local _m
-  for _m in "${model_ids[@]}"; do
-    [[ "$_m" == "glm-4.7" ]] && opus_default="$_m"
-    [[ "$_m" == *air* ]]    && haiku_default="$_m"
-  done
+  # Output variables populated by either the saved-profile path or the prompts below.
+  local base_url opus_model sonnet_model haiku_model ctx timeout_ms
 
-  # Render the model list with a (current) marker for the given tier default.
-  _zai_print_models() {
-    local current="$1" idx=1 m
-    for m in "${model_ids[@]}"; do
-      if [[ "$m" == "$current" ]]; then
-        printf "  %d) %s  (current)\n" "$idx" "$m" >&2
-      else
-        printf "  %d) %s\n" "$idx" "$m" >&2
-      fi
-      (( idx++ ))
-    done
-  }
-
-  # Resolve a user choice ("1", "c", "s", "") to a model ID.
-  # Args: choice, default_on_empty, same_as_value ("" if "s" isn't offered).
-  # Echoes the resolved model ID; returns non-zero on invalid input.
-  _zai_resolve() {
-    local choice="$1" default_m="$2" same_as="$3"
-    case "$choice" in
-      c|C) ask 'Custom model ID' "$default_m" ;;
-      s|S)
-        if [[ -n "$same_as" ]]; then echo "$same_as"
-        else echo "Invalid selection." >&2; return 1; fi
-        ;;
-      "")  echo "$default_m" ;;
-      *)
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_ids[@]} )); then
-          echo "${model_ids[$choice]}"
-        else
-          echo "Invalid selection." >&2; return 1
-        fi
-        ;;
+  if $use_saved; then
+    base_url="$d_base_url"
+    opus_model="$d_opus"
+    sonnet_model="$d_sonnet"
+    haiku_model="$d_haiku"
+    ctx="$d_ctx"
+    timeout_ms="$d_timeout_ms"
+  else
+    # --- 4. Base URL ---
+    echo "" >&2
+    echo "Base URL:" >&2
+    echo "  1) https://api.z.ai/api/anthropic        (official Claude Code endpoint — recommended)" >&2
+    echo "  2) https://api.z.ai/api/coding/paas/v4   (Coding Plan subscription, OpenAI protocol)" >&2
+    echo "  3) Custom" >&2
+    local url_default_hint="1"
+    [[ -n "$d_base_url" ]] && url_default_hint="current: $d_base_url"
+    printf "Choice [%s]: " "$url_default_hint" >&2
+    local uchoice
+    read -r uchoice
+    case "${uchoice:-}" in
+      1) base_url="https://api.z.ai/api/anthropic" ;;
+      2) base_url="https://api.z.ai/api/coding/paas/v4" ;;
+      3) base_url="$(ask 'Custom base URL' "${d_base_url:-https://api.z.ai/api/anthropic}")" ;;
+      "") base_url="${d_base_url:-https://api.z.ai/api/anthropic}" ;;
+      *)  echo "Invalid selection." >&2; exit 1 ;;
     esac
-  }
 
-  # --- Tier: Opus ---
-  echo "" >&2
-  echo "Model for OPUS tier (highest capability — /model opus inside Claude Code):" >&2
-  _zai_print_models "$d_opus"
-  echo "  c) Custom" >&2
-  local _opus_def="${d_opus:-$opus_default}"
-  printf "Choice [%s]: " "$_opus_def" >&2
-  local opus_choice opus_model
-  read -r opus_choice
-  opus_model="$(_zai_resolve "$opus_choice" "$_opus_def" "")" || exit 1
+    # --- 5. Per-tier model selection ---
+    # Fetch live model list from Z.ai's OpenAI-compat /models endpoint
+    # (the anthropic-compat endpoint doesn't expose one). Same API key works.
+    echo "" >&2
+    echo "Fetching model list from Z.ai..." >&2
+    local models_json
+    models_json="$(curl -sf --max-time 10 \
+      -H "Authorization: Bearer $ZAI_API_KEY" \
+      "https://api.z.ai/api/paas/v4/models" 2>/dev/null || echo '')"
 
-  # --- Tier: Sonnet ---
-  echo "" >&2
-  echo "Model for SONNET tier (default conversation):" >&2
-  _zai_print_models "$d_sonnet"
-  echo "  s) Same as Opus ($opus_model)" >&2
-  echo "  c) Custom" >&2
-  local _sonnet_def="${d_sonnet:-$opus_model}"
-  printf "Choice [%s]: " "$_sonnet_def" >&2
-  local sonnet_choice sonnet_model
-  read -r sonnet_choice
-  sonnet_model="$(_zai_resolve "$sonnet_choice" "$_sonnet_def" "$opus_model")" || exit 1
+    local -a model_ids
+    if [[ -n "$models_json" ]] && echo "$models_json" | jq -e '.data' >/dev/null 2>&1; then
+      model_ids=( "${(f)$(echo "$models_json" | jq -r '.data[].id' | sort -u)}" )
+    else
+      echo "  (/models fetch failed — using built-in list)" >&2
+      model_ids=( glm-4.5 glm-4.5-air glm-4.6 glm-4.7 )
+    fi
 
-  # --- Tier: Haiku ---
-  echo "" >&2
-  echo "Model for HAIKU tier (subagents, background, fast/cheap):" >&2
-  _zai_print_models "$d_haiku"
-  echo "  s) Same as Sonnet ($sonnet_model)" >&2
-  echo "  c) Custom" >&2
-  local _haiku_def="${d_haiku:-$haiku_default}"
-  printf "Choice [%s]: " "$_haiku_def" >&2
-  local haiku_choice haiku_model
-  read -r haiku_choice
-  haiku_model="$(_zai_resolve "$haiku_choice" "$_haiku_def" "$sonnet_model")" || exit 1
+    # Heuristic defaults: Opus → glm-4.7 if present, Haiku → a *-air variant if present.
+    local opus_default="${model_ids[1]}" haiku_default="${model_ids[${#model_ids[@]}]}"
+    local _m
+    for _m in "${model_ids[@]}"; do
+      [[ "$_m" == "glm-4.7" ]] && opus_default="$_m"
+      [[ "$_m" == *air* ]]    && haiku_default="$_m"
+    done
 
-  # --- 6. Context + timeout ---
-  echo "" >&2
-  local ctx timeout_ms
-  ctx="$(ask 'Context length (tokens)' "$d_ctx")"
-  timeout_ms="$(ask 'API_TIMEOUT_MS' "$d_timeout_ms")"
+    # Render the model list with a (current) marker for the given tier default.
+    _zai_print_models() {
+      local current="$1" idx=1 m
+      for m in "${model_ids[@]}"; do
+        if [[ "$m" == "$current" ]]; then
+          printf "  %d) %s  (current)\n" "$idx" "$m" >&2
+        else
+          printf "  %d) %s\n" "$idx" "$m" >&2
+        fi
+        (( idx++ ))
+      done
+    }
 
-  # --- 7. Save profile ---
-  jq -n \
-    --arg url "$base_url" \
-    --arg opus "$opus_model" \
-    --arg sonnet "$sonnet_model" \
-    --arg haiku "$haiku_model" \
-    --argjson c "$ctx" \
-    --argjson t "$timeout_ms" \
-    '{base_url: $url, opus_model: $opus, sonnet_model: $sonnet, haiku_model: $haiku, context_length: $c, api_timeout_ms: $t}' \
-    > "$profile"
+    # Resolve a user choice ("1", "c", "s", "") to a model ID.
+    # Args: choice, default_on_empty, same_as_value ("" if "s" isn't offered).
+    _zai_resolve() {
+      local choice="$1" default_m="$2" same_as="$3"
+      case "$choice" in
+        c|C) ask 'Custom model ID' "$default_m" ;;
+        s|S)
+          if [[ -n "$same_as" ]]; then echo "$same_as"
+          else echo "Invalid selection." >&2; return 1; fi
+          ;;
+        "")  echo "$default_m" ;;
+        *)
+          if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_ids[@]} )); then
+            echo "${model_ids[$choice]}"
+          else
+            echo "Invalid selection." >&2; return 1
+          fi
+          ;;
+      esac
+    }
+
+    # --- Tier: Opus ---
+    echo "" >&2
+    echo "Model for OPUS tier (highest capability — /model opus inside Claude Code):" >&2
+    _zai_print_models "$d_opus"
+    echo "  c) Custom" >&2
+    local _opus_def="${d_opus:-$opus_default}"
+    printf "Choice [%s]: " "$_opus_def" >&2
+    local opus_choice
+    read -r opus_choice
+    opus_model="$(_zai_resolve "$opus_choice" "$_opus_def" "")" || exit 1
+
+    # --- Tier: Sonnet ---
+    echo "" >&2
+    echo "Model for SONNET tier (default conversation):" >&2
+    _zai_print_models "$d_sonnet"
+    echo "  s) Same as Opus ($opus_model)" >&2
+    echo "  c) Custom" >&2
+    local _sonnet_def="${d_sonnet:-$opus_model}"
+    printf "Choice [%s]: " "$_sonnet_def" >&2
+    local sonnet_choice
+    read -r sonnet_choice
+    sonnet_model="$(_zai_resolve "$sonnet_choice" "$_sonnet_def" "$opus_model")" || exit 1
+
+    # --- Tier: Haiku ---
+    echo "" >&2
+    echo "Model for HAIKU tier (subagents, background, fast/cheap):" >&2
+    _zai_print_models "$d_haiku"
+    echo "  s) Same as Sonnet ($sonnet_model)" >&2
+    echo "  c) Custom" >&2
+    local _haiku_def="${d_haiku:-$haiku_default}"
+    printf "Choice [%s]: " "$_haiku_def" >&2
+    local haiku_choice
+    read -r haiku_choice
+    haiku_model="$(_zai_resolve "$haiku_choice" "$_haiku_def" "$sonnet_model")" || exit 1
+
+    # --- 6. Context + timeout ---
+    echo "" >&2
+    ctx="$(ask 'Context length (tokens)' "$d_ctx")"
+    timeout_ms="$(ask 'API_TIMEOUT_MS' "$d_timeout_ms")"
+
+    # --- 7. Save profile ---
+    jq -n \
+      --arg url "$base_url" \
+      --arg opus "$opus_model" \
+      --arg sonnet "$sonnet_model" \
+      --arg haiku "$haiku_model" \
+      --argjson c "$ctx" \
+      --argjson t "$timeout_ms" \
+      '{base_url: $url, opus_model: $opus, sonnet_model: $sonnet, haiku_model: $haiku, context_length: $c, api_timeout_ms: $t}' \
+      > "$profile"
+    echo "" >&2
+    echo "Profile saved." >&2
+  fi
 
   # --- 8. Launch ---
   # Startup tier = Sonnet (Claude Code's default). User can /model opus or /model haiku in-session.
