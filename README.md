@@ -31,14 +31,46 @@ mkdir -p ~/.config/cclm
 ## Usage
 
 ```bash
-cclm                       # interactive backend picker
+cclm                       # profile picker (or backend picker if no profiles)
 cclm --lms                 # LM Studio backend directly
 cclm --llama               # llama.cpp backend directly
 cclm --llama -c            # passthrough flag to claude (resume last session)
 cclm --llama --resume      # passthrough --resume to claude
 ```
 
-Flow:
+### Profile Picker
+
+On first run with saved profiles, `cclm` shows a unified profile picker:
+
+```
+Saved profiles:
+
+  1) [llama] Qwen3.5-27B        remote:192.168.1.100  ctx:262144
+  2) [llama] gemma-4-E2B        local                 ctx:130000
+  3) [lms]   qwen3.5-27b        local                 ctx:200000
+
+  n) New session (full config)  q) Quit
+
+Choice: 1
+
+  [llama] Qwen3.5-27B
+    o) Open/launch
+    e) Edit parameters
+    d) Delete
+    b) Back to list
+
+  Action [o]: ← press Enter = launch
+```
+
+Actions:
+- **o (open)**: Launch immediately with saved profile settings
+- **e (edit)**: Reconfigure params (current values as defaults), then launch
+- **d (delete)**: Remove the profile (with confirmation)
+- **n (new)**: Skip picker, use the classic backend/model selection flow
+
+### Classic Flow
+
+When no profiles exist or you choose "New session":
 
 1. Pick backend (LM Studio or llama.cpp)
 2. Pick or enter a model
@@ -54,6 +86,9 @@ Profiles are plain JSON files saved per-model, prefixed by backend:
 
 - LM Studio: `~/.config/cclm/lms-<slug>.json`
 - llama.cpp: `~/.config/cclm/llama-<slug>.json`
+- Z.ai: `~/.config/cclm/zai-<name>.json`
+
+Each profile stores the model path, server parameters (context length, GPU layers, sampling settings, port, etc.), and for remote setups, the host address.
 
 See `profiles/examples/` for starter templates. The script will offer to save your answers on first launch and reload them next time.
 
