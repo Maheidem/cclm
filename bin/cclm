@@ -8,6 +8,7 @@ set -euo pipefail
 
 CONFIG_DIR="$HOME/.config/cclm"
 MODELS_DIR="${CCLM_MODELS_DIR:-$HOME/.cache/lm-studio/models}"
+STATE_FILE="$CONFIG_DIR/.last_session"
 mkdir -p "$CONFIG_DIR"
 
 # Portable file size: macOS `stat -f%z`, Linux `stat -c%s`
@@ -46,6 +47,32 @@ human_size() {
   else
     printf "%.1f KB" "$(( bytes / 1024.0 ))"
   fi
+}
+
+# Last session state (populated by load_last_session)
+last_backend="" last_profile="" last_remote="" last_model=""
+
+# Load last session state from STATE_FILE
+load_last_session() {
+  if [[ -f "$STATE_FILE" ]]; then
+    last_backend=$(jq -r '.backend // empty' "$STATE_FILE")
+    last_profile=$(jq -r '.profile // empty' "$STATE_FILE")
+    last_remote=$(jq -r '.remote_host // empty' "$STATE_FILE")
+    last_model=$(jq -r '.model // empty' "$STATE_FILE")
+    return 0
+  fi
+  return 1
+}
+
+# Save last session state to STATE_FILE
+save_last_session() {
+  local backend="$1" profile="$2" remote_host="$3" model="$4"
+  jq -n \
+    --arg be "$backend" \
+    --arg prof "$profile" \
+    --arg rh "${remote_host:-}" \
+    --arg mod "$model" \
+    '{backend: $be, profile: $prof, remote_host: $rh, model: $mod}' > "$STATE_FILE"
 }
 
 # Set env vars and launch claude. Args: mode, api_id, host, port, context_length, extra_claude_args...
@@ -120,15 +147,34 @@ while (( $# )); do
   shift
 done
 
+# Try to load last session
+load_last_session
+
 if [[ -z "$backend" ]]; then
   echo "" >&2
   echo "Select backend:" >&2
+
+  # Show resume option if available
+  if [[ -n "$last_backend" && -n "$last_profile" ]]; then
+    echo "  0) Resume last session ($last_backend @ ${last_remote:-local}, $last_model)" >&2
+  fi
+
   echo "  1) LM Studio" >&2
   echo "  2) llama.cpp" >&2
   echo "" >&2
-  printf "Choice (1-2): " >&2
+
+  if [[ -n "$last_backend" ]]; then
+    printf "Choice (0-2): " >&2
+  else
+    printf "Choice (1-2): " >&2
+  fi
   read -r bchoice
+
   case "$bchoice" in
+    0)
+      backend="$last_backend"
+      remote_host="$last_remote"
+      ;;
     1) backend="lms" ;;
     2) backend="llama" ;;
     *) echo "Invalid selection." >&2; exit 1 ;;
@@ -239,6 +285,7 @@ run_lms() {
         exit 1
       fi
 
+      save_last_session "lms" "lms-$(slug "$lms_model_key").json" "$LMS_HOST" "$lms_model_key"
       launch_claude exec "$lms_model_key" "$LMS_HOST" "$LMS_PORT" "$lms_ctx" "${passthrough_args[@]}"
       return
     fi
@@ -277,6 +324,7 @@ run_lms() {
     local ctx_size
     ctx_size=$(ask "Context window (tokens)" "65536")
 
+    save_last_session "lms" "lms-$(slug "$api_id").json" "$LMS_HOST" "$api_id"
     launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
     return
   fi
@@ -426,6 +474,7 @@ run_lms() {
   local api_id
   api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end')
 
+  save_last_session "lms" "lms-$(slug "$api_id").json" "$LMS_HOST" "$api_id"
   launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
 }
 
@@ -640,6 +689,7 @@ run_llama() {
       ctx_len="$actual_ctx"
     fi
 
+    save_last_session "llama" "$chosen_profile" "$llama_host" "$model_id"
     launch_claude exec "$model_id" "$llama_host" "$port" "$ctx_len" "${passthrough_args[@]}"
     return
   fi
@@ -956,6 +1006,7 @@ run_llama() {
     exit 1
   fi
 
+  save_last_session "llama" "$(basename "$profile")" "$llama_host" "$model_id"
   launch_claude fg "$model_id" "$llama_host" "$port" "$ctx_len" "${passthrough_args[@]}"
 }
 
