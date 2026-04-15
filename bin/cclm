@@ -178,6 +178,134 @@ done
 # Try to load last session (return 1 is normal on first run — no state file yet).
 load_last_session || true
 
+# ============================================================================
+# Profile Picker
+# ============================================================================
+
+pick_profile() {
+  # Scans all saved profiles and presents a unified picker.
+  # Returns 0 with globals set, or 1 to fall through to backend picker.
+  # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
+
+  local -a profiles
+  profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+
+  # No saved profiles — skip picker entirely
+  (( ${#profiles[@]} == 0 )) && return 1
+
+  while true; do
+    echo "" >&2
+    echo "Saved profiles:" >&2
+    echo "" >&2
+
+    local i=1 be_tag model_name host_info ctx_info
+    for f in "${profiles[@]}"; do
+      local base="${f:t}"
+      case "$base" in
+        llama-*) be_tag="llama" ;;
+        lms-*)   be_tag="lms" ;;
+        zai-*)   be_tag="zai" ;;
+      esac
+
+      case "$be_tag" in
+        llama)
+          model_name=$(jq -r '.model // "${base}"' "$f")
+          local rh=$(jq -r '.remote_host // empty' "$f")
+          host_info="${rh:+remote:$rh}"
+          [[ -z "$host_info" ]] && host_info="local"
+          ctx_info=$(jq -r '.ctx_len // "?"' "$f")
+          ;;
+        lms)
+          model_name=$(jq -r '.model // "${base}"' "$f")
+          local rh=$(jq -r '.remote_host // empty' "$f")
+          host_info="${rh:+remote:$rh}"
+          [[ -z "$host_info" ]] && host_info="local"
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+        zai)
+          local pname="${base#zai-}"; pname="${pname%.json}"
+          model_name=$(jq -r '.sonnet_model // "?"' "$f")
+          host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+      esac
+
+      printf "  %2d) [%-5s] %-28s %-21s ctx:%s\n" "$i" "$be_tag" \
+        "${model_name:0:28}" "$host_info" "$ctx_info" >&2
+      (( i++ ))
+    done
+
+    echo "" >&2
+    echo "  n) New session (full config)" >&2
+    echo "  q) Quit" >&2
+    echo "" >&2
+    printf "Choice: " >&2
+    read -r choice
+
+    [[ "$choice" == "q" ]] && exit 0
+    [[ "$choice" == "n" ]] && return 1
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#profiles[@]} )); then
+      echo "Invalid selection." >&2
+      continue
+    fi
+
+    local picked="${profiles[$choice]}"
+    local picked_base="${picked:t}"
+    local picked_backend="${picked_base%%-*}"
+
+    # Action sub-menu
+    local display_model
+    case "$picked_backend" in
+      llama) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      lms)   display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      zai)   display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
+    esac
+
+    echo "" >&2
+    echo "  [$picked_backend] $display_model" >&2
+    echo "    o) Open/launch" >&2
+    echo "    e) Edit parameters" >&2
+    echo "    d) Delete" >&2
+    echo "    b) Back to list" >&2
+    echo "" >&2
+    printf "  Action [o]: " >&2
+    read -r action
+    action="${action:-o}"
+
+    case "$action" in
+      o|O)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="open"
+        backend="$picked_backend"
+        return 0
+        ;;
+      e|E)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="edit"
+        backend="$picked_backend"
+        return 0
+        ;;
+      d|D)
+        printf "  Delete %s? (y/N): " "$picked_base" >&2
+        read -r del_confirm
+        if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+          rm "$picked"
+          echo "  Deleted." >&2
+          # Refresh list
+          profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+          (( ${#profiles[@]} == 0 )) && return 1
+        fi
+        # Reset counter and re-display
+        i=1
+        continue
+        ;;
+      b|B) i=1; continue ;;
+      *) echo "  Invalid action." >&2; i=1; continue ;;
+    esac
+  done
+}
+
 # --- Profile picker (runs first when no backend flag) ---
 _PRELOADED_PROFILE="" _PRELOADED_ACTION=""
 if [[ -z "$backend" ]] && pick_profile; then
@@ -1492,134 +1620,6 @@ run_zai() {
   printf "  %-7s → %s  (subagents)\n" "Haiku" "$haiku_model" >&2
 
   launch_claude exec "$sonnet_model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
-}
-
-# ============================================================================
-# Profile Picker
-# ============================================================================
-
-pick_profile() {
-  # Scans all saved profiles and presents a unified picker.
-  # Returns 0 with globals set, or 1 to fall through to backend picker.
-  # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
-
-  local -a profiles
-  profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
-
-  # No saved profiles — skip picker entirely
-  (( ${#profiles[@]} == 0 )) && return 1
-
-  while true; do
-    echo "" >&2
-    echo "Saved profiles:" >&2
-    echo "" >&2
-
-    local i=1 be_tag model_name host_info ctx_info
-    for f in "${profiles[@]}"; do
-      local base="${f:t}"
-      case "$base" in
-        llama-*) be_tag="llama" ;;
-        lms-*)   be_tag="lms" ;;
-        zai-*)   be_tag="zai" ;;
-      esac
-
-      case "$be_tag" in
-        llama)
-          model_name=$(jq -r '.model // "${base}"' "$f")
-          local rh=$(jq -r '.remote_host // empty' "$f")
-          host_info="${rh:+remote:$rh}"
-          [[ -z "$host_info" ]] && host_info="local"
-          ctx_info=$(jq -r '.ctx_len // "?"' "$f")
-          ;;
-        lms)
-          model_name=$(jq -r '.model // "${base}"' "$f")
-          local rh=$(jq -r '.remote_host // empty' "$f")
-          host_info="${rh:+remote:$rh}"
-          [[ -z "$host_info" ]] && host_info="local"
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-        zai)
-          local pname="${base#zai-}"; pname="${pname%.json}"
-          model_name=$(jq -r '.sonnet_model // "?"' "$f")
-          host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-      esac
-
-      printf "  %2d) [%-5s] %-28s %-21s ctx:%s\n" "$i" "$be_tag" \
-        "${model_name:0:28}" "$host_info" "$ctx_info" >&2
-      (( i++ ))
-    done
-
-    echo "" >&2
-    echo "  n) New session (full config)" >&2
-    echo "  q) Quit" >&2
-    echo "" >&2
-    printf "Choice: " >&2
-    read -r choice
-
-    [[ "$choice" == "q" ]] && exit 0
-    [[ "$choice" == "n" ]] && return 1
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#profiles[@]} )); then
-      echo "Invalid selection." >&2
-      continue
-    fi
-
-    local picked="${profiles[$choice]}"
-    local picked_base="${picked:t}"
-    local picked_backend="${picked_base%%-*}"
-
-    # Action sub-menu
-    local display_model
-    case "$picked_backend" in
-      llama) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      lms)   display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      zai)   display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
-    esac
-
-    echo "" >&2
-    echo "  [$picked_backend] $display_model" >&2
-    echo "    o) Open/launch" >&2
-    echo "    e) Edit parameters" >&2
-    echo "    d) Delete" >&2
-    echo "    b) Back to list" >&2
-    echo "" >&2
-    printf "  Action [o]: " >&2
-    read -r action
-    action="${action:-o}"
-
-    case "$action" in
-      o|O)
-        _PRELOADED_PROFILE="$picked"
-        _PRELOADED_ACTION="open"
-        backend="$picked_backend"
-        return 0
-        ;;
-      e|E)
-        _PRELOADED_PROFILE="$picked"
-        _PRELOADED_ACTION="edit"
-        backend="$picked_backend"
-        return 0
-        ;;
-      d|D)
-        printf "  Delete %s? (y/N): " "$picked_base" >&2
-        read -r del_confirm
-        if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-          rm "$picked"
-          echo "  Deleted." >&2
-          # Refresh list
-          profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
-          (( ${#profiles[@]} == 0 )) && return 1
-        fi
-        # Reset counter and re-display
-        i=1
-        continue
-        ;;
-      b|B) i=1; continue ;;
-      *) echo "  Invalid action." >&2; i=1; continue ;;
-    esac
-  done
 }
 
 # ============================================================================
