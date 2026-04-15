@@ -103,14 +103,13 @@ launch_claude() {
   unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
 
   export ANTHROPIC_MODEL="$api_id"
-  export CLAUDE_CODE_SUBAGENT_MODEL="$api_id"
-  # Providers that do server-side model mapping (Z.ai) request we NOT hardcode
-  # ANTHROPIC_DEFAULT_*_MODEL so auto-upgrades work. Skip when CCLM_NO_DEFAULT_MODELS=1.
-  if [[ -z "${CCLM_NO_DEFAULT_MODELS:-}" ]]; then
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="$api_id"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="$api_id"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$api_id"
-  fi
+  # Per-tier routing: backends that support distinct models per Claude tier
+  # (Z.ai) set CCLM_TIER_OPUS / CCLM_TIER_SONNET / CCLM_TIER_HAIKU. Local backends
+  # leave them unset, so all three tiers collapse to $api_id (single loaded model).
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="${CCLM_TIER_OPUS:-$api_id}"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="${CCLM_TIER_SONNET:-$api_id}"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${CCLM_TIER_HAIKU:-$api_id}"
+  export CLAUDE_CODE_SUBAGENT_MODEL="${CCLM_TIER_HAIKU:-$api_id}"
 
   export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx"
   export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$ctx"
@@ -1109,10 +1108,19 @@ run_zai() {
   fi
 
   # --- 3. Load saved values (defaults for prompts) ---
-  local d_base_url="" d_model="" d_ctx="200000" d_timeout_ms="3000000"
+  local d_base_url="" d_opus="" d_sonnet="" d_haiku=""
+  local d_ctx="200000" d_timeout_ms="3000000"
   if [[ -f "$profile" ]]; then
     d_base_url=$(jq -r '.base_url // ""' "$profile")
-    d_model=$(jq -r '.model // ""' "$profile")
+    d_opus=$(jq -r '.opus_model // ""' "$profile")
+    d_sonnet=$(jq -r '.sonnet_model // ""' "$profile")
+    d_haiku=$(jq -r '.haiku_model // ""' "$profile")
+    # Back-compat with old single-model profile schema.
+    local _d_legacy
+    _d_legacy=$(jq -r '.model // ""' "$profile")
+    [[ -z "$d_opus"   && -n "$_d_legacy" ]] && d_opus="$_d_legacy"
+    [[ -z "$d_sonnet" && -n "$_d_legacy" ]] && d_sonnet="$_d_legacy"
+    [[ -z "$d_haiku"  && -n "$_d_legacy" ]] && d_haiku="$_d_legacy"
     d_ctx=$(jq -r '.context_length // 200000' "$profile")
     d_timeout_ms=$(jq -r '.api_timeout_ms // 3000000' "$profile")
   fi
@@ -1136,7 +1144,9 @@ run_zai() {
     *)  echo "Invalid selection." >&2; exit 1 ;;
   esac
 
-  # --- 5. Model — fetch from /models, fall back to built-in list ---
+  # --- 5. Per-tier model selection ---
+  # Fetch live model list from Z.ai's OpenAI-compat /models endpoint
+  # (the anthropic-compat endpoint doesn't expose one). Same API key works.
   echo "" >&2
   echo "Fetching model list from Z.ai..." >&2
   local models_json
@@ -1149,37 +1159,86 @@ run_zai() {
     model_ids=( "${(f)$(echo "$models_json" | jq -r '.data[].id' | sort -u)}" )
   else
     echo "  (/models fetch failed — using built-in list)" >&2
-    model_ids=( glm-4.7 glm-4.6 glm-4.5 glm-4.5-air )
+    model_ids=( glm-4.5 glm-4.5-air glm-4.6 glm-4.7 )
   fi
 
-  echo "" >&2
-  echo "Model:" >&2
-  i=1
-  for m in "${model_ids[@]}"; do
-    if [[ "$m" == "$d_model" ]]; then
-      printf "  %d) %s  (current)\n" "$i" "$m" >&2
-    else
-      printf "  %d) %s\n" "$i" "$m" >&2
-    fi
-    (( i++ ))
+  # Heuristic defaults: Opus → glm-4.7 if present, Haiku → a *-air variant if present.
+  local opus_default="${model_ids[1]}" haiku_default="${model_ids[${#model_ids[@]}]}"
+  local _m
+  for _m in "${model_ids[@]}"; do
+    [[ "$_m" == "glm-4.7" ]] && opus_default="$_m"
+    [[ "$_m" == *air* ]]    && haiku_default="$_m"
   done
-  echo "  c) Custom" >&2
-  local model_default_hint="1"
-  [[ -n "$d_model" ]] && model_default_hint="keep current"
-  printf "Choice [%s]: " "$model_default_hint" >&2
-  local mchoice model
-  read -r mchoice
-  case "${mchoice:-}" in
-    c|C) model="$(ask 'Custom model ID' "${d_model:-glm-4.7}")" ;;
-    "")  model="${d_model:-${model_ids[1]}}" ;;
-    *)
-      if [[ "$mchoice" =~ ^[0-9]+$ ]] && (( mchoice >= 1 && mchoice <= ${#model_ids[@]} )); then
-        model="${model_ids[$mchoice]}"
+
+  # Render the model list with a (current) marker for the given tier default.
+  _zai_print_models() {
+    local current="$1" idx=1 m
+    for m in "${model_ids[@]}"; do
+      if [[ "$m" == "$current" ]]; then
+        printf "  %d) %s  (current)\n" "$idx" "$m" >&2
       else
-        echo "Invalid selection." >&2; exit 1
+        printf "  %d) %s\n" "$idx" "$m" >&2
       fi
-      ;;
-  esac
+      (( idx++ ))
+    done
+  }
+
+  # Resolve a user choice ("1", "c", "s", "") to a model ID.
+  # Args: choice, default_on_empty, same_as_value ("" if "s" isn't offered).
+  # Echoes the resolved model ID; returns non-zero on invalid input.
+  _zai_resolve() {
+    local choice="$1" default_m="$2" same_as="$3"
+    case "$choice" in
+      c|C) ask 'Custom model ID' "$default_m" ;;
+      s|S)
+        if [[ -n "$same_as" ]]; then echo "$same_as"
+        else echo "Invalid selection." >&2; return 1; fi
+        ;;
+      "")  echo "$default_m" ;;
+      *)
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#model_ids[@]} )); then
+          echo "${model_ids[$choice]}"
+        else
+          echo "Invalid selection." >&2; return 1
+        fi
+        ;;
+    esac
+  }
+
+  # --- Tier: Opus ---
+  echo "" >&2
+  echo "Model for OPUS tier (highest capability — /model opus inside Claude Code):" >&2
+  _zai_print_models "$d_opus"
+  echo "  c) Custom" >&2
+  local _opus_def="${d_opus:-$opus_default}"
+  printf "Choice [%s]: " "$_opus_def" >&2
+  local opus_choice opus_model
+  read -r opus_choice
+  opus_model="$(_zai_resolve "$opus_choice" "$_opus_def" "")" || exit 1
+
+  # --- Tier: Sonnet ---
+  echo "" >&2
+  echo "Model for SONNET tier (default conversation):" >&2
+  _zai_print_models "$d_sonnet"
+  echo "  s) Same as Opus ($opus_model)" >&2
+  echo "  c) Custom" >&2
+  local _sonnet_def="${d_sonnet:-$opus_model}"
+  printf "Choice [%s]: " "$_sonnet_def" >&2
+  local sonnet_choice sonnet_model
+  read -r sonnet_choice
+  sonnet_model="$(_zai_resolve "$sonnet_choice" "$_sonnet_def" "$opus_model")" || exit 1
+
+  # --- Tier: Haiku ---
+  echo "" >&2
+  echo "Model for HAIKU tier (subagents, background, fast/cheap):" >&2
+  _zai_print_models "$d_haiku"
+  echo "  s) Same as Sonnet ($sonnet_model)" >&2
+  echo "  c) Custom" >&2
+  local _haiku_def="${d_haiku:-$haiku_default}"
+  printf "Choice [%s]: " "$_haiku_def" >&2
+  local haiku_choice haiku_model
+  read -r haiku_choice
+  haiku_model="$(_zai_resolve "$haiku_choice" "$_haiku_def" "$sonnet_model")" || exit 1
 
   # --- 6. Context + timeout ---
   echo "" >&2
@@ -1190,22 +1249,31 @@ run_zai() {
   # --- 7. Save profile ---
   jq -n \
     --arg url "$base_url" \
-    --arg m "$model" \
+    --arg opus "$opus_model" \
+    --arg sonnet "$sonnet_model" \
+    --arg haiku "$haiku_model" \
     --argjson c "$ctx" \
     --argjson t "$timeout_ms" \
-    '{base_url: $url, model: $m, context_length: $c, api_timeout_ms: $t}' \
+    '{base_url: $url, opus_model: $opus, sonnet_model: $sonnet, haiku_model: $haiku, context_length: $c, api_timeout_ms: $t}' \
     > "$profile"
 
   # --- 8. Launch ---
-  save_last_session "zai" "$(basename "$profile")" "$base_url" "$model"
+  # Startup tier = Sonnet (Claude Code's default). User can /model opus or /model haiku in-session.
+  save_last_session "zai" "$(basename "$profile")" "$base_url" "$sonnet_model"
 
-  # Signal to launch_claude: real token auth + don't hardcode ANTHROPIC_DEFAULT_*_MODEL
-  # (Z.ai handles Claude→GLM mapping server-side; pinning defaults breaks auto-upgrades).
   export CCLM_AUTH_TOKEN="$ZAI_API_KEY"
-  export CCLM_NO_DEFAULT_MODELS="1"
+  export CCLM_TIER_OPUS="$opus_model"
+  export CCLM_TIER_SONNET="$sonnet_model"
+  export CCLM_TIER_HAIKU="$haiku_model"
   export CCLM_API_TIMEOUT_MS="$timeout_ms"
 
-  launch_claude exec "$model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
+  echo "" >&2
+  echo "Tier routing:" >&2
+  printf "  %-7s → %s\n" "Opus"   "$opus_model"   >&2
+  printf "  %-7s → %s  (startup)\n" "Sonnet" "$sonnet_model" >&2
+  printf "  %-7s → %s  (subagents)\n" "Haiku" "$haiku_model" >&2
+
+  launch_claude exec "$sonnet_model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
 }
 
 # ============================================================================
