@@ -149,6 +149,12 @@ for f in "$CONFIG_DIR"/*.json(N); do
   fi
 done
 
+# Add remote_host field to profiles that lack it (backward compat)
+for f in "$CONFIG_DIR"/{llama,lms}-*.json(N); do
+  jq -e 'has("remote_host")' "$f" >/dev/null 2>&1 && continue
+  _tmp=$(mktemp) && jq '. + {remote_host: null}' "$f" > "$_tmp" && mv "$_tmp" "$f"
+done
+
 # ============================================================================
 # Argument Parsing
 # ============================================================================
@@ -172,7 +178,16 @@ done
 # Try to load last session (return 1 is normal on first run — no state file yet).
 load_last_session || true
 
-if [[ -z "$backend" ]]; then
+# --- Profile picker (runs first when no backend flag) ---
+_PRELOADED_PROFILE="" _PRELOADED_ACTION=""
+if [[ -z "$backend" ]] && pick_profile; then
+  # backend was set by pick_profile — dispatch directly
+  :
+elif [[ -n "$_PRELOADED_PROFILE" ]]; then
+  # Backend was pre-selected via --lms/--llama/--zai, profile picked
+  :
+elif [[ -z "$backend" ]]; then
+  # No profile picked — show existing backend picker
   echo "" >&2
   echo "Select backend:" >&2
 
@@ -206,7 +221,7 @@ if [[ -z "$backend" ]]; then
 fi
 
 # Remote-host prompt applies to local-backend flows only; Z.ai picks its base URL inside run_zai.
-if [[ -z "$remote_host" && "$backend" != "zai" ]]; then
+if [[ -z "$remote_host" && "$backend" != "zai" && -z "$_PRELOADED_PROFILE" ]]; then
   printf "  Remote host               [local]: " >&2
   read -r _rhost
   remote_host="${_rhost:-}"
@@ -223,6 +238,101 @@ run_lms() {
 
   local is_lms_remote=false
   [[ "$LMS_HOST" != "localhost" && "$LMS_HOST" != "127.0.0.1" ]] && is_lms_remote=true
+
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    local _pl_model _pl_ctx _pl_gpu _pl_parallel _pl_ttl _pl_id _pl_rh
+    _pl_model=$(jq -r '.model' "$_PRELOADED_PROFILE")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+    _pl_gpu=$(jq -r '.gpu // "max"' "$_PRELOADED_PROFILE")
+    _pl_parallel=$(jq -r '.parallel // "1"' "$_PRELOADED_PROFILE")
+    _pl_ttl=$(jq -r '.ttl // ""' "$_PRELOADED_PROFILE")
+    _pl_id=$(jq -r '.identifier // ""' "$_PRELOADED_PROFILE")
+    _pl_rh=$(jq -r '.remote_host // ""' "$_PRELOADED_PROFILE")
+    LMS_HOST="${_pl_rh:-localhost}"
+    [[ "$LMS_HOST" == "null" ]] && LMS_HOST="localhost"
+    LMS_URL="http://${LMS_HOST}:${LMS_PORT}"
+    [[ "$LMS_HOST" != "localhost" && "$LMS_HOST" != "127.0.0.1" ]] && is_lms_remote=true
+
+    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
+      # Fast launch: skip all model selection, load and connect directly
+      echo "" >&2
+      echo "  [$LMS_HOST] $_pl_model" >&2
+      if $is_lms_remote; then
+        # Remote: check server, poll if needed, connect
+        local server_up=false
+        curl -sf --max-time 3 "${LMS_URL}/v1/models" > /dev/null 2>&1 && server_up=true
+        if ! $server_up; then
+          echo "" >&2
+          echo "  ────────────────────────────────────────────────────────────────" >&2
+          echo "  Run this on $LMS_HOST:" >&2
+          echo "" >&2
+          printf "  lms server start --port %s && \\\\\n" "$LMS_PORT" >&2
+          printf "  lms load \"%s\" -c %s --gpu %s --parallel %s -y\n" \
+            "$_pl_model" "$_pl_ctx" "$_pl_gpu" "$_pl_parallel" >&2
+          echo "" >&2
+          echo "  ────────────────────────────────────────────────────────────────" >&2
+          echo "" >&2
+          printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$LMS_HOST" "$LMS_PORT" >&2
+          local waited=0 timeout=300
+          while (( waited < timeout )); do
+            if curl -sf --max-time 2 "${LMS_URL}/v1/models" 2>/dev/null | jq -e '.data | length > 0' > /dev/null 2>&1; then
+              echo " ready." >&2
+              break
+            fi
+            printf "." >&2
+            sleep 5
+            waited=$((waited + 5))
+          done
+          if (( waited >= timeout )); then
+            echo "" >&2
+            echo "Timed out (${timeout}s)." >&2
+            exit 1
+          fi
+        fi
+        save_last_session "lms" "$(basename "$_PRELOADED_PROFILE")" "$LMS_HOST" "$_pl_model"
+        launch_claude exec "$_pl_model" "$LMS_HOST" "$LMS_PORT" "$_pl_ctx" "${passthrough_args[@]}"
+      else
+        # Local: check LMS, load model, launch
+        if ! curl -s "${LMS_URL}/v1/models" > /dev/null 2>&1; then
+          echo "LM Studio is not reachable at ${LMS_URL}" >&2
+          echo "Start it with: lms server start --port ${LMS_PORT}" >&2
+          exit 1
+        fi
+        local loaded_id
+        loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty')
+        if [[ -n "$loaded_id" && "$loaded_id" != "$_pl_model" ]]; then
+          echo "Unloading: $loaded_id" >&2
+          lms unload "$loaded_id" 2>/dev/null || true
+        fi
+        local -a load_args=("-c" "$_pl_ctx" "--gpu" "$_pl_gpu" "--parallel" "$_pl_parallel" "-y")
+        [[ -n "$_pl_ttl" ]] && load_args+=("--ttl" "${_pl_ttl}s")
+        [[ -n "$_pl_id" ]] && load_args+=("--identifier" "$_pl_id")
+        load_args+=("$_pl_model")
+        echo "Loading: $_pl_model" >&2
+        echo "  ctx:$_pl_ctx  gpu:$_pl_gpu  parallel:$_pl_parallel" >&2
+        lms load "${load_args[@]}"
+        local api_id
+        api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end')
+        save_last_session "lms" "$(basename "$_PRELOADED_PROFILE")" "$LMS_HOST" "$api_id"
+        launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$_pl_ctx" "${passthrough_args[@]}"
+      fi
+      return
+    else
+      # Edit: fall through to existing flow with profile context
+      # Set lms_model_key for remote path or chosen for local path
+      # The existing code will show config prompts with current values as defaults
+      if $is_lms_remote; then
+        # For remote, let the normal flow run — user will re-enter model key
+        # but the profile will be there for "Use saved?" prompt
+        :
+      else
+        # For local, pre-set chosen so model listing is skipped
+        # (declared below in local flow — will be checked with -z)
+        :
+      fi
+    fi
+  fi
 
   # --- Remote LM Studio ---
   if $is_lms_remote; then
@@ -277,7 +387,8 @@ run_lms() {
           --arg ctx "$lms_ctx" \
           --arg gpu "$lms_gpu" \
           --arg par "$lms_parallel" \
-          '{model: $model, context_length: $ctx, gpu: $gpu, parallel: $par}' > "$lms_profile"
+          --arg rh "$LMS_HOST" \
+          '{model: $model, context_length: $ctx, gpu: $gpu, parallel: $par, remote_host: (if $rh == "" then null else $rh end)}' > "$lms_profile"
         echo "" >&2
         echo "Profile saved." >&2
       fi
@@ -468,7 +579,8 @@ run_lms() {
         gpu: $gpu,
         parallel: $par,
         ttl: (if $ttl == "" then null else $ttl end),
-        identifier: (if $id == "" then null else $id end)
+        identifier: (if $id == "" then null else $id end),
+        remote_host: null
       }' > "$profile"
 
     echo "" >&2
@@ -520,24 +632,38 @@ run_llama() {
   local port="" parallel_slots="" slot_save_path="" cache_ram=""
   local use_saved=false
 
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    model_id=$(jq -r '.model' "$_PRELOADED_PROFILE")
+    chosen_path=$(jq -r '.model_path' "$_PRELOADED_PROFILE")
+    llama_host=$(jq -r '.remote_host // "localhost"' "$_PRELOADED_PROFILE")
+    [[ -z "$llama_host" || "$llama_host" == "null" ]] && llama_host="localhost"
+    [[ "$llama_host" != "localhost" && "$llama_host" != "127.0.0.1" ]] && is_remote=true
+    profile="$_PRELOADED_PROFILE"
+    [[ "${_PRELOADED_ACTION:-open}" == "open" ]] && use_saved=true
+  fi
+
   if $is_remote; then
     # ========================================================================
     # Remote: ask model path, configure, generate one-liner, poll, connect
     # ========================================================================
 
-    echo "" >&2
-    echo "Remote llama-server target: $llama_host" >&2
-    echo "" >&2
-    chosen_path=$(ask "Model path on $llama_host" "")
-    if [[ -z "$chosen_path" ]]; then
-      echo "Model path is required." >&2
-      exit 1
+    # Model selection — skip when preloaded from profile picker
+    if [[ -z "$model_id" ]]; then
+      echo "" >&2
+      echo "Remote llama-server target: $llama_host" >&2
+      echo "" >&2
+      chosen_path=$(ask "Model path on $llama_host" "")
+      if [[ -z "$chosen_path" ]]; then
+        echo "Model path is required." >&2
+        exit 1
+      fi
+      local _fname="${chosen_path:t}"
+      model_id="${_fname%.gguf}"
+      profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
     fi
-    local _fname="${chosen_path:t}"
-    model_id="${_fname%.gguf}"
-    profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
 
-    if [[ -f "$profile" ]]; then
+    if [[ -f "$profile" ]] && ! $use_saved; then
       echo "" >&2
       echo "Saved profile for $model_id:" >&2
       echo "" >&2
@@ -646,6 +772,7 @@ run_llama() {
         --arg port "$port" --arg np "$parallel_slots" \
         --arg ssp "$slot_save_path" --arg cram "$cache_ram" \
         --arg model "$model_id" --arg path "$chosen_path" \
+        --arg rh "$llama_host" \
         '{
           model: $model, model_path: $path,
           ctx_len: $ctx, gpu_layers: $ngl, flash_attn: $fa,
@@ -654,7 +781,8 @@ run_llama() {
           temperature: $temp, top_p: $tp, top_k: $tk, min_p: $mp, repeat_penalty: $rp,
           port: $port, parallel_slots: $np,
           slot_save_path: (if $ssp == "" then null else $ssp end),
-          cache_ram: (if $cram == "" then null else $cram end)
+          cache_ram: (if $cram == "" then null else $cram end),
+          remote_host: (if $rh == "localhost" or $rh == "127.0.0.1" or $rh == "" then null else $rh end)
         }' > "$profile"
       echo "" >&2
       echo "Profile saved." >&2
@@ -714,7 +842,7 @@ run_llama() {
       ctx_len="$actual_ctx"
     fi
 
-    save_last_session "llama" "$chosen_profile" "$llama_host" "$model_id"
+    save_last_session "llama" "$(basename "$profile")" "$llama_host" "$model_id"
     launch_claude exec "$model_id" "$llama_host" "$port" "$ctx_len" "${passthrough_args[@]}"
     return
   fi
@@ -723,73 +851,76 @@ run_llama() {
   # Local: scan GGUF files, configure, start llama-server, connect
   # ========================================================================
 
-  if [[ ! -d "$MODELS_DIR" ]]; then
-    echo "Models directory not found: $MODELS_DIR" >&2
-    exit 1
-  fi
+  # Model selection — skip when preloaded from profile picker
+  if [[ -z "$model_id" ]]; then
+    if [[ ! -d "$MODELS_DIR" ]]; then
+      echo "Models directory not found: $MODELS_DIR" >&2
+      exit 1
+    fi
 
-  local gguf_files=()
-  local gguf_sizes=()
-  local gguf_dirs=()
+    local gguf_files=()
+    local gguf_sizes=()
+    local gguf_dirs=()
 
-  while IFS= read -r -d '' fpath; do
-    gguf_files+=("$fpath")
-    gguf_sizes+=("$(_stat_size "$fpath")")
-    gguf_dirs+=("$(basename "$(dirname "$(dirname "$fpath")")")")
-  done < <(find "$MODELS_DIR" -name "*.gguf" -not -name "mmproj*" -print0 | sort -z)
+    while IFS= read -r -d '' fpath; do
+      gguf_files+=("$fpath")
+      gguf_sizes+=("$(_stat_size "$fpath")")
+      gguf_dirs+=("$(basename "$(dirname "$(dirname "$fpath")")")")
+    done < <(find "$MODELS_DIR" -name "*.gguf" -not -name "mmproj*" -print0 | sort -z)
 
-  local model_count=${#gguf_files[@]}
-  if (( model_count == 0 )); then
-    echo "No GGUF models found in $MODELS_DIR" >&2
-    exit 1
-  fi
+    local model_count=${#gguf_files[@]}
+    if (( model_count == 0 )); then
+      echo "No GGUF models found in $MODELS_DIR" >&2
+      exit 1
+    fi
 
-  echo "" >&2
-  echo "Available GGUF models:" >&2
-  echo "" >&2
-  local fname hsize pdir saved_tag name_no_ext
-  for ((i=0; i<model_count; i++)); do
-    saved_tag=""
-    fname="${gguf_files[$((i+1))]:t}"
-    hsize=$(human_size "${gguf_sizes[$((i+1))]}")
-    pdir="${gguf_dirs[$((i+1))]}"
-    name_no_ext="${fname%.gguf}"
-    [[ -f "$CONFIG_DIR/llama-$(slug "$name_no_ext").json" ]] && saved_tag=" *"
-    printf "  %2d) %-42s %8s  (%s)%s\n" $((i+1)) "$fname" "$hsize" "$pdir" "$saved_tag" >&2
-  done
-  echo "" >&2
-  echo "  (* = saved profile)" >&2
-  echo "" >&2
-
-  printf "Select model (1-%d): " "$model_count" >&2
-  read -r selection
-
-  if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > model_count )); then
-    echo "Invalid selection." >&2
-    exit 1
-  fi
-
-  chosen_path="${gguf_files[$selection]}"
-  chosen_fname="${chosen_path:t}"
-  model_id="${chosen_fname%.gguf}"
-  model_dir="${chosen_path:h}"
-  profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
-
-  # --- mmproj detection (optional) ---
-  mmproj_match=$(find "$model_dir" -name "mmproj*.gguf" -print -quit 2>/dev/null)
-  if [[ -n "$mmproj_match" ]]; then
     echo "" >&2
-    echo "Multimodal projector found: ${mmproj_match:t}" >&2
-    echo "  Note: enabling mmproj disables slot save/restore (KV cache persistence)." >&2
-    printf "  Load mmproj? (y/N): " >&2
-    read -r mmproj_reply
-    if [[ "$mmproj_reply" =~ ^[Yy]$ ]]; then
-      mmproj_path="$mmproj_match"
+    echo "Available GGUF models:" >&2
+    echo "" >&2
+    local fname hsize pdir saved_tag name_no_ext
+    for ((i=0; i<model_count; i++)); do
+      saved_tag=""
+      fname="${gguf_files[$((i+1))]:t}"
+      hsize=$(human_size "${gguf_sizes[$((i+1))]}")
+      pdir="${gguf_dirs[$((i+1))]}"
+      name_no_ext="${fname%.gguf}"
+      [[ -f "$CONFIG_DIR/llama-$(slug "$name_no_ext").json" ]] && saved_tag=" *"
+      printf "  %2d) %-42s %8s  (%s)%s\n" $((i+1)) "$fname" "$hsize" "$pdir" "$saved_tag" >&2
+    done
+    echo "" >&2
+    echo "  (* = saved profile)" >&2
+    echo "" >&2
+
+    printf "Select model (1-%d): " "$model_count" >&2
+    read -r selection
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > model_count )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+
+    chosen_path="${gguf_files[$selection]}"
+    chosen_fname="${chosen_path:t}"
+    model_id="${chosen_fname%.gguf}"
+    model_dir="${chosen_path:h}"
+    profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
+
+    # --- mmproj detection (optional) ---
+    mmproj_match=$(find "$model_dir" -name "mmproj*.gguf" -print -quit 2>/dev/null)
+    if [[ -n "$mmproj_match" ]]; then
+      echo "" >&2
+      echo "Multimodal projector found: ${mmproj_match:t}" >&2
+      echo "  Note: enabling mmproj disables slot save/restore (KV cache persistence)." >&2
+      printf "  Load mmproj? (y/N): " >&2
+      read -r mmproj_reply
+      if [[ "$mmproj_reply" =~ ^[Yy]$ ]]; then
+        mmproj_path="$mmproj_match"
+      fi
     fi
   fi
 
   # --- Profile load or configure ---
-  if [[ -f "$profile" ]]; then
+  if [[ -f "$profile" ]] && ! $use_saved; then
     echo "" >&2
     echo "Saved profile for $model_id:" >&2
     echo "" >&2
@@ -933,7 +1064,8 @@ run_llama() {
         port: $port,
         parallel_slots: $np,
         slot_save_path: (if $ssp == "" then null else $ssp end),
-        cache_ram: (if $cram == "" then null else $cram end)
+        cache_ram: (if $cram == "" then null else $cram end),
+        remote_host: null
       }' > "$profile"
 
     echo "" >&2
@@ -1075,35 +1207,88 @@ run_zai() {
     export ZAI_API_KEY="$_key"
   fi
 
-  # --- 2. Profile selection ---
-  # Profiles key on a user-chosen name so multiple deployments can coexist
-  # (e.g., zai-payg, zai-coding-plan, zai-cheap).
-  echo "" >&2
-  echo "Z.ai profile:" >&2
-  local -a zai_profiles
-  zai_profiles=( "$CONFIG_DIR"/zai-*.json(N) )
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    local profile="$_PRELOADED_PROFILE"
+    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
+      # Fast launch: read profile, set env vars, connect
+      local base_url opus_model sonnet_model haiku_model ctx timeout_ms
+      base_url=$(jq -r '.base_url // ""' "$profile")
+      opus_model=$(jq -r '.opus_model // ""' "$profile")
+      sonnet_model=$(jq -r '.sonnet_model // ""' "$profile")
+      haiku_model=$(jq -r '.haiku_model // ""' "$profile")
+      ctx=$(jq -r '.context_length // 200000' "$profile")
+      timeout_ms=$(jq -r '.api_timeout_ms // 3000000' "$profile")
 
-  local i=1 prof_name profile=""
-  for f in "${zai_profiles[@]}"; do
-    prof_name="${f:t:r}"            # basename, strip .json
-    prof_name="${prof_name#zai-}"    # strip zai- prefix
-    printf "  %d) %s\n" "$i" "$prof_name" >&2
-    (( i++ ))
-  done
-  echo "  n) New profile" >&2
-  printf "Choice: " >&2
-  local pchoice
-  read -r pchoice
+      # Back-compat with old single-model schema
+      local _legacy
+      _legacy=$(jq -r '.model // ""' "$profile")
+      [[ -z "$opus_model"   && -n "$_legacy" ]] && opus_model="$_legacy"
+      [[ -z "$sonnet_model" && -n "$_legacy" ]] && sonnet_model="$_legacy"
+      [[ -z "$haiku_model"  && -n "$_legacy" ]] && haiku_model="$_legacy"
 
-  if [[ -z "$pchoice" || "$pchoice" == [nN] ]]; then
-    local new_name
-    new_name="$(ask 'Profile name' 'default')"
-    profile="$CONFIG_DIR/zai-$(slug "$new_name").json"
-  else
-    if [[ "$pchoice" =~ ^[0-9]+$ ]] && (( pchoice >= 1 && pchoice <= ${#zai_profiles[@]} )); then
-      profile="${zai_profiles[$pchoice]}"
+      echo "" >&2
+      echo "  [zai] $sonnet_model @ ${base_url}" >&2
+
+      save_last_session "zai" "$(basename "$profile")" "$base_url" "$sonnet_model"
+      export CCLM_AUTH_TOKEN="$ZAI_API_KEY"
+      export CCLM_TIER_OPUS="$opus_model"
+      export CCLM_TIER_SONNET="$sonnet_model"
+      export CCLM_TIER_HAIKU="$haiku_model"
+      export CCLM_API_TIMEOUT_MS="$timeout_ms"
+
+      echo "" >&2
+      echo "Tier routing:" >&2
+      printf "  %-7s → %s\n" "Opus"   "$opus_model"   >&2
+      printf "  %-7s → %s  (startup)\n" "Sonnet" "$sonnet_model" >&2
+      printf "  %-7s → %s  (subagents)\n" "Haiku" "$haiku_model" >&2
+
+      launch_claude exec "$sonnet_model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
+      return
     else
-      echo "Invalid selection." >&2; exit 1
+      # Edit: skip profile selection, set profile so existing flow uses it
+      # The existing profile loading code will pick it up with use_saved=false
+      local prof_name="${profile:t:r}"
+      prof_name="${prof_name#zai-}"
+      echo "" >&2
+      echo "Editing profile: $prof_name" >&2
+      # Fall through — the profile selection below will be skipped
+    fi
+  else
+    local profile=""
+  fi
+
+  # --- 2. Profile selection ---
+  if [[ -z "$profile" ]]; then
+    # Profiles key on a user-chosen name so multiple deployments can coexist
+    # (e.g., zai-payg, zai-coding-plan, zai-cheap).
+    echo "" >&2
+    echo "Z.ai profile:" >&2
+    local -a zai_profiles
+    zai_profiles=( "$CONFIG_DIR"/zai-*.json(N) )
+
+    local i=1
+    for f in "${zai_profiles[@]}"; do
+      prof_name="${f:t:r}"            # basename, strip .json
+      prof_name="${prof_name#zai-}"    # strip zai- prefix
+      printf "  %d) %s\n" "$i" "$prof_name" >&2
+      (( i++ ))
+    done
+    echo "  n) New profile" >&2
+    printf "Choice: " >&2
+    local pchoice
+    read -r pchoice
+
+    if [[ -z "$pchoice" || "$pchoice" == [nN] ]]; then
+      local new_name
+      new_name="$(ask 'Profile name' 'default')"
+      profile="$CONFIG_DIR/zai-$(slug "$new_name").json"
+    else
+      if [[ "$pchoice" =~ ^[0-9]+$ ]] && (( pchoice >= 1 && pchoice <= ${#zai_profiles[@]} )); then
+        profile="${zai_profiles[$pchoice]}"
+      else
+        echo "Invalid selection." >&2; exit 1
+      fi
     fi
   fi
 
@@ -1127,7 +1312,10 @@ run_zai() {
 
   # --- 3b. Use saved profile as-is? (skip all prompts if yes) ---
   local use_saved=false
-  if [[ -f "$profile" && -n "$d_base_url" && -n "$d_opus" && -n "$d_sonnet" && -n "$d_haiku" ]]; then
+  # When preloaded with "edit" action, force use_saved=false to show config prompts
+  if [[ "${_PRELOADED_ACTION:-}" == "edit" ]]; then
+    use_saved=false
+  elif [[ -f "$profile" && -n "$d_base_url" && -n "$d_opus" && -n "$d_sonnet" && -n "$d_haiku" ]]; then
     echo "" >&2
     echo "Saved profile:" >&2
     printf "  %-13s %s\n" "Base URL:" "$d_base_url"     >&2
@@ -1307,7 +1495,135 @@ run_zai() {
 }
 
 # ============================================================================
-# Main
+# Profile Picker
+# ============================================================================
+
+pick_profile() {
+  # Scans all saved profiles and presents a unified picker.
+  # Returns 0 with globals set, or 1 to fall through to backend picker.
+  # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
+
+  local -a profiles
+  profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+
+  # No saved profiles — skip picker entirely
+  (( ${#profiles[@]} == 0 )) && return 1
+
+  while true; do
+    echo "" >&2
+    echo "Saved profiles:" >&2
+    echo "" >&2
+
+    local i=1 be_tag model_name host_info ctx_info
+    for f in "${profiles[@]}"; do
+      local base="${f:t}"
+      case "$base" in
+        llama-*) be_tag="llama" ;;
+        lms-*)   be_tag="lms" ;;
+        zai-*)   be_tag="zai" ;;
+      esac
+
+      case "$be_tag" in
+        llama)
+          model_name=$(jq -r '.model // "${base}"' "$f")
+          local rh=$(jq -r '.remote_host // empty' "$f")
+          host_info="${rh:+remote:$rh}"
+          [[ -z "$host_info" ]] && host_info="local"
+          ctx_info=$(jq -r '.ctx_len // "?"' "$f")
+          ;;
+        lms)
+          model_name=$(jq -r '.model // "${base}"' "$f")
+          local rh=$(jq -r '.remote_host // empty' "$f")
+          host_info="${rh:+remote:$rh}"
+          [[ -z "$host_info" ]] && host_info="local"
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+        zai)
+          local pname="${base#zai-}"; pname="${pname%.json}"
+          model_name=$(jq -r '.sonnet_model // "?"' "$f")
+          host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+      esac
+
+      printf "  %2d) [%-5s] %-28s %-21s ctx:%s\n" "$i" "$be_tag" \
+        "${model_name:0:28}" "$host_info" "$ctx_info" >&2
+      (( i++ ))
+    done
+
+    echo "" >&2
+    echo "  n) New session (full config)" >&2
+    echo "  q) Quit" >&2
+    echo "" >&2
+    printf "Choice: " >&2
+    read -r choice
+
+    [[ "$choice" == "q" ]] && exit 0
+    [[ "$choice" == "n" ]] && return 1
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#profiles[@]} )); then
+      echo "Invalid selection." >&2
+      continue
+    fi
+
+    local picked="${profiles[$choice]}"
+    local picked_base="${picked:t}"
+    local picked_backend="${picked_base%%-*}"
+
+    # Action sub-menu
+    local display_model
+    case "$picked_backend" in
+      llama) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      lms)   display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      zai)   display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
+    esac
+
+    echo "" >&2
+    echo "  [$picked_backend] $display_model" >&2
+    echo "    o) Open/launch" >&2
+    echo "    e) Edit parameters" >&2
+    echo "    d) Delete" >&2
+    echo "    b) Back to list" >&2
+    echo "" >&2
+    printf "  Action [o]: " >&2
+    read -r action
+    action="${action:-o}"
+
+    case "$action" in
+      o|O)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="open"
+        backend="$picked_backend"
+        return 0
+        ;;
+      e|E)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="edit"
+        backend="$picked_backend"
+        return 0
+        ;;
+      d|D)
+        printf "  Delete %s? (y/N): " "$picked_base" >&2
+        read -r del_confirm
+        if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+          rm "$picked"
+          echo "  Deleted." >&2
+          # Refresh list
+          profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+          (( ${#profiles[@]} == 0 )) && return 1
+        fi
+        # Reset counter and re-display
+        i=1
+        continue
+        ;;
+      b|B) i=1; continue ;;
+      *) echo "  Invalid action." >&2; i=1; continue ;;
+    esac
+  done
+}
+
+# ============================================================================
+# Main dispatch — backend is set by profile picker or backend picker above
 # ============================================================================
 
 case "$backend" in
