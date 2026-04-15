@@ -1,0 +1,8 @@
+{
+  "model": "your-model-identifier",
+  "context_length": "131072",
+  "gpu": "max",
+  "parallel": "1",
+  "ttl": "360",
+  "identifier": "your-model-identifier"
+}

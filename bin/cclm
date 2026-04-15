@@ -1,0 +1,969 @@
+#!/usr/bin/env zsh
+# cclm - Claude Code via Local Models
+# Supports LM Studio and llama.cpp (llama-server) backends.
+# Selects a local model, configures load/server parameters, and launches Claude Code.
+# Saves per-model profiles to ~/.config/cclm/ for reuse.
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/cclm"
+MODELS_DIR="${CCLM_MODELS_DIR:-$HOME/.cache/lm-studio/models}"
+mkdir -p "$CONFIG_DIR"
+
+# Portable file size: macOS `stat -f%z`, Linux `stat -c%s`
+if [[ "$(uname)" == "Darwin" ]]; then
+  _stat_size() { stat -f%z "$1"; }
+else
+  _stat_size() { stat -c%s "$1"; }
+fi
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Slugify a string into a safe filename
+slug() { echo "$1" | tr '/' '_' | tr ' ' '-' | tr -cd 'A-Za-z0-9._-'; }
+
+# Prompt with a default value. Prompt goes to stderr, value to stdout.
+ask() {
+  local label="$1" default="$2" reply
+  if [[ -n "$default" ]]; then
+    printf "  %-24s [%s]: " "$label" "$default" >&2
+  else
+    printf "  %-24s: " "$label" >&2
+  fi
+  read -r reply
+  echo "${reply:-$default}"
+}
+
+# Human-readable file size
+human_size() {
+  local bytes=$1
+  if (( bytes >= 1073741824 )); then
+    printf "%.1f GB" "$(( bytes / 1073741824.0 ))"
+  elif (( bytes >= 1048576 )); then
+    printf "%.1f MB" "$(( bytes / 1048576.0 ))"
+  else
+    printf "%.1f KB" "$(( bytes / 1024.0 ))"
+  fi
+}
+
+# Set env vars and launch claude. Args: mode, api_id, host, port, context_length, extra_claude_args...
+# mode is "exec" (replaces process) or "fg" (foreground, returns when done)
+launch_claude() {
+  local mode="$1" api_id="$2" host="$3" port="$4" ctx="$5"
+  shift 5
+
+  export ANTHROPIC_BASE_URL="http://${host}:${port}"
+  # Use a placeholder key — local endpoints don't need real auth.
+  # Explicitly clear subscription tokens so they can't leak through.
+  export ANTHROPIC_API_KEY="lmstudio"
+  unset ANTHROPIC_AUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+
+  export ANTHROPIC_MODEL="$api_id"
+  export CLAUDE_CODE_SUBAGENT_MODEL="$api_id"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$api_id"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$api_id"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$api_id"
+
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx"
+  export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$ctx"
+
+  export CLAUDE_CODE_ATTRIBUTION_HEADER="0"
+  export DISABLE_TELEMETRY="1"
+  export DISABLE_ERROR_REPORTING="1"
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
+  export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING="1"
+
+  echo "" >&2
+  echo "Model:   $api_id" >&2
+  echo "Backend: http://${host}:${port}" >&2
+  echo "Context: ${ctx} tokens  (CLAUDE_CODE_AUTO_COMPACT_WINDOW=${ctx})" >&2
+  echo "" >&2
+
+  if [[ "$mode" == "exec" ]]; then
+    exec claude --model "$api_id" "$@"
+  else
+    claude --model "$api_id" "$@"
+  fi
+}
+
+# ============================================================================
+# Profile Migration
+# ============================================================================
+
+for f in "$CONFIG_DIR"/*.json(N); do
+  _base="${f:t}"
+  if [[ "$_base" != lms-* && "$_base" != llama-* ]]; then
+    mv "$f" "$CONFIG_DIR/lms-${_base}"
+  fi
+done
+
+# ============================================================================
+# Argument Parsing
+# ============================================================================
+
+backend=""
+remote_host=""
+passthrough_args=()
+
+while (( $# )); do
+  case "$1" in
+    --lms)   backend="lms" ;;
+    --llama) backend="llama" ;;
+    --host)  remote_host="$2"; shift ;;
+    --host=*) remote_host="${1#--host=}" ;;
+    *)       passthrough_args+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ -z "$backend" ]]; then
+  echo "" >&2
+  echo "Select backend:" >&2
+  echo "  1) LM Studio" >&2
+  echo "  2) llama.cpp" >&2
+  echo "" >&2
+  printf "Choice (1-2): " >&2
+  read -r bchoice
+  case "$bchoice" in
+    1) backend="lms" ;;
+    2) backend="llama" ;;
+    *) echo "Invalid selection." >&2; exit 1 ;;
+  esac
+fi
+
+if [[ -z "$remote_host" ]]; then
+  printf "  Remote host               [local]: " >&2
+  read -r _rhost
+  remote_host="${_rhost:-}"
+fi
+
+# ============================================================================
+# LM Studio Backend
+# ============================================================================
+
+run_lms() {
+  local LMS_HOST="${remote_host:-localhost}"
+  local LMS_PORT=1234
+  local LMS_URL="http://${LMS_HOST}:${LMS_PORT}"
+
+  local is_lms_remote=false
+  [[ "$LMS_HOST" != "localhost" && "$LMS_HOST" != "127.0.0.1" ]] && is_lms_remote=true
+
+  # --- Remote LM Studio ---
+  if $is_lms_remote; then
+    local server_up=false
+    curl -sf --max-time 3 "${LMS_URL}/v1/models" > /dev/null 2>&1 && server_up=true
+
+    if ! $server_up; then
+      # Server not running: walk through config, generate one-liner, poll
+      echo "" >&2
+      echo "LM Studio at ${LMS_URL} is not reachable." >&2
+      echo "" >&2
+
+      local lms_model_key lms_ctx lms_gpu lms_parallel lms_profile
+      lms_model_key=$(ask "Model key on $LMS_HOST (e.g., qwen/qwen3.5-27b)" "")
+      if [[ -z "$lms_model_key" ]]; then
+        echo "Model key is required." >&2
+        exit 1
+      fi
+      lms_profile="$CONFIG_DIR/lms-$(slug "$lms_model_key").json"
+
+      local use_lms_saved=false
+      if [[ -f "$lms_profile" ]]; then
+        echo "" >&2
+        echo "Saved profile for $lms_model_key:" >&2
+        printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$lms_profile")" >&2
+        printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$lms_profile")" >&2
+        printf "  %-20s %s\n" "Parallel:" "$(jq -r '.parallel' "$lms_profile")" >&2
+        echo "" >&2
+        printf "Use saved profile? (Y/n): " >&2
+        read -r use_reply
+        [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_lms_saved=true
+      fi
+
+      local d_lctx="65536" d_lgpu="max" d_lpar="1"
+      if [[ -f "$lms_profile" ]]; then
+        d_lctx=$(jq -r '.context_length // "65536"' "$lms_profile")
+        d_lgpu=$(jq -r '.gpu // "max"' "$lms_profile")
+        d_lpar=$(jq -r '.parallel // "1"' "$lms_profile")
+      fi
+
+      if $use_lms_saved; then
+        lms_ctx="$d_lctx"; lms_gpu="$d_lgpu"; lms_parallel="$d_lpar"
+      else
+        echo "" >&2
+        echo "Configure parameters (press Enter for default):" >&2
+        echo "" >&2
+        lms_ctx=$(ask "Context length" "$d_lctx")
+        lms_gpu=$(ask "GPU offload" "$d_lgpu")
+        lms_parallel=$(ask "Parallel requests" "$d_lpar")
+        jq -n \
+          --arg model "$lms_model_key" \
+          --arg ctx "$lms_ctx" \
+          --arg gpu "$lms_gpu" \
+          --arg par "$lms_parallel" \
+          '{model: $model, context_length: $ctx, gpu: $gpu, parallel: $par}' > "$lms_profile"
+        echo "" >&2
+        echo "Profile saved." >&2
+      fi
+
+      echo "" >&2
+      echo "  ────────────────────────────────────────────────────────────────" >&2
+      echo "  Run this on $LMS_HOST:" >&2
+      echo "" >&2
+      printf "  lms server start --port %s && \\\\\n" "$LMS_PORT" >&2
+      printf "  lms load \"%s\" -c %s --gpu %s --parallel %s -y\n" \
+        "$lms_model_key" "$lms_ctx" "$lms_gpu" "$lms_parallel" >&2
+      echo "" >&2
+      echo "  ────────────────────────────────────────────────────────────────" >&2
+      echo "" >&2
+
+      printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$LMS_HOST" "$LMS_PORT" >&2
+      local waited=0 timeout=300
+      while (( waited < timeout )); do
+        if curl -sf --max-time 2 "${LMS_URL}/v1/models" 2>/dev/null | jq -e '.data | length > 0' > /dev/null 2>&1; then
+          echo " ready." >&2
+          break
+        fi
+        printf "." >&2
+        sleep 5
+        waited=$((waited + 5))
+      done
+      if (( waited >= timeout )); then
+        echo "" >&2
+        echo "Timed out (${timeout}s)." >&2
+        exit 1
+      fi
+
+      launch_claude exec "$lms_model_key" "$LMS_HOST" "$LMS_PORT" "$lms_ctx" "${passthrough_args[@]}"
+      return
+    fi
+
+    # Server IS running: query and select model
+    local api_models
+    api_models=$(curl -s "${LMS_URL}/v1/models" 2>/dev/null | jq -r '.data[].id' | grep -v 'embedding')
+
+    if [[ -z "$api_models" ]]; then
+      echo "No models available on remote LM Studio at ${LMS_URL}" >&2
+      exit 1
+    fi
+
+    echo "" >&2
+    echo "Models on remote LM Studio (${LMS_HOST}):" >&2
+    echo "" >&2
+    local count=0
+    local model_list=()
+    while IFS= read -r mid; do
+      count=$((count + 1))
+      model_list+=("$mid")
+      printf "  %d) %s\n" "$count" "$mid" >&2
+    done <<< "$api_models"
+    echo "" >&2
+
+    printf "Select model (1-%d): " "$count" >&2
+    read -r selection
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+
+    local api_id="${model_list[$selection]}"
+    echo "" >&2
+    local ctx_size
+    ctx_size=$(ask "Context window (tokens)" "65536")
+
+    launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
+    return
+  fi
+
+  # --- Local LM Studio: preflight check ---
+  if ! curl -s "${LMS_URL}/v1/models" > /dev/null 2>&1; then
+    echo "LM Studio is not reachable at ${LMS_URL}" >&2
+    echo "Start it with: lms server start --port ${LMS_PORT}" >&2
+    exit 1
+  fi
+
+  local models_json
+  models_json=$(lms ls --llm --json 2>/dev/null)
+
+  if [[ -z "$models_json" ]] || [[ "$(echo "$models_json" | jq 'length')" -eq 0 ]]; then
+    echo "No LLM models found in LM Studio." >&2
+    exit 1
+  fi
+
+  local loaded_id
+  loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty')
+
+  echo "" >&2
+  echo "Available LM Studio models:" >&2
+  echo "" >&2
+  local count
+  count=$(echo "$models_json" | jq 'length')
+  local key display params max_ctx tool_use loaded_marker tool_tag saved_tag
+  for ((i=0; i<count; i++)); do
+    loaded_marker="" tool_tag="" saved_tag=""
+    key=$(echo "$models_json" | jq -r ".[$i].modelKey")
+    display=$(echo "$models_json" | jq -r ".[$i].displayName")
+    params=$(echo "$models_json" | jq -r ".[$i].paramsString")
+    max_ctx=$(echo "$models_json" | jq -r ".[$i].maxContextLength")
+    tool_use=$(echo "$models_json" | jq -r ".[$i].trainedForToolUse")
+    [[ "$key" = "$loaded_id" ]] && loaded_marker=" [LOADED]"
+    [[ "$tool_use" = "true" ]] && tool_tag=" tools"
+    [[ -f "$CONFIG_DIR/lms-$(slug "$key").json" ]] && saved_tag=" *"
+    printf "  %d) %-30s %6s  ctx:%dk%s%s%s\n" \
+      $((i+1)) "$display" "$params" $((max_ctx/1024)) "$tool_tag" "$loaded_marker" "$saved_tag" >&2
+  done
+  echo "" >&2
+  echo "  (* = saved profile)" >&2
+  echo "" >&2
+
+  printf "Select model (1-%d): " "$count" >&2
+  read -r selection
+
+  if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
+    echo "Invalid selection." >&2
+    exit 1
+  fi
+
+  local chosen chosen_max_ctx profile
+  chosen=$(echo "$models_json" | jq -r ".[$((selection-1))].modelKey")
+  chosen_max_ctx=$(echo "$models_json" | jq -r ".[$((selection-1))].maxContextLength")
+  profile="$CONFIG_DIR/lms-$(slug "$chosen").json"
+
+  # Load or edit profile
+  local use_saved=false
+  if [[ -f "$profile" ]]; then
+    echo "" >&2
+    echo "Saved profile for $chosen:" >&2
+    echo "" >&2
+    printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$profile")" >&2
+    printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$profile")" >&2
+    printf "  %-20s %s\n" "Parallel requests:" "$(jq -r '.parallel' "$profile")" >&2
+    printf "  %-20s %s\n" "TTL (seconds):" "$(jq -r '.ttl' "$profile")" >&2
+    printf "  %-20s %s\n" "API identifier:" "$(jq -r '.identifier' "$profile")" >&2
+    echo "" >&2
+    printf "Use saved profile? (Y/n): " >&2
+    read -r use_reply
+    if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
+      use_saved=true
+    fi
+  fi
+
+  local ctx_size gpu parallel ttl identifier
+  if $use_saved; then
+    ctx_size=$(jq -r '.context_length' "$profile")
+    gpu=$(jq -r '.gpu' "$profile")
+    parallel=$(jq -r '.parallel' "$profile")
+    ttl=$(jq -r '.ttl // ""' "$profile")
+    identifier=$(jq -r '.identifier // ""' "$profile")
+  else
+    local def_ctx def_gpu="max" def_parallel="1" def_ttl="" def_id=""
+    def_ctx=$((chosen_max_ctx < 32768 ? chosen_max_ctx : 32768))
+
+    if [[ -f "$profile" ]]; then
+      def_ctx=$(jq -r '.context_length' "$profile")
+      def_gpu=$(jq -r '.gpu' "$profile")
+      def_parallel=$(jq -r '.parallel' "$profile")
+      def_ttl=$(jq -r '.ttl // ""' "$profile")
+      def_id=$(jq -r '.identifier // ""' "$profile")
+    fi
+
+    echo "" >&2
+    echo "Configure load parameters (press Enter for default):" >&2
+    echo "" >&2
+    ctx_size=$(ask "Context length" "$def_ctx")
+    gpu=$(ask "GPU offload" "$def_gpu")
+    parallel=$(ask "Parallel requests" "$def_parallel")
+    ttl=$(ask "TTL (seconds)" "$def_ttl")
+    identifier=$(ask "API identifier" "$def_id")
+
+    jq -n \
+      --arg ctx "$ctx_size" \
+      --arg gpu "$gpu" \
+      --arg par "$parallel" \
+      --arg ttl "$ttl" \
+      --arg id "$identifier" \
+      --arg model "$chosen" \
+      '{
+        model: $model,
+        context_length: $ctx,
+        gpu: $gpu,
+        parallel: $par,
+        ttl: (if $ttl == "" then null else $ttl end),
+        identifier: (if $id == "" then null else $id end)
+      }' > "$profile"
+
+    echo "" >&2
+    echo "Profile saved to $profile" >&2
+  fi
+
+  # Build lms load command
+  local load_args=("$chosen" "-c" "$ctx_size" "--gpu" "$gpu" "--parallel" "$parallel" "-y")
+  [[ -n "$ttl" ]] && load_args+=("--ttl" "$ttl")
+  [[ -n "$identifier" ]] && load_args+=("--identifier" "$identifier")
+
+  # Load model
+  if [[ "$chosen" = "$loaded_id" ]]; then
+    echo "" >&2
+    echo "Model already loaded: $chosen" >&2
+  else
+    echo "" >&2
+    if [[ -n "$loaded_id" ]]; then
+      echo "Unloading: $loaded_id" >&2
+      lms unload "$loaded_id" 2>/dev/null || true
+    fi
+    echo "Loading: $chosen" >&2
+    echo "  ctx:$ctx_size  gpu:$gpu  parallel:$parallel${ttl:+  ttl:${ttl}s}${identifier:+  id:$identifier}" >&2
+    lms load "${load_args[@]}"
+  fi
+
+  # Resolve API identifier
+  local api_id
+  api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end')
+
+  launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
+}
+
+# ============================================================================
+# llama.cpp Backend
+# ============================================================================
+
+run_llama() {
+  # Determine remote vs local early — governs the entire flow
+  local llama_host="${remote_host:-localhost}"
+  local is_remote=false
+  [[ "$llama_host" != "localhost" && "$llama_host" != "127.0.0.1" ]] && is_remote=true
+
+  # Shared param variables
+  local chosen_path="" model_id="" profile="" chosen_fname="" model_dir="" mmproj_path="" mmproj_match=""
+  local ctx_len="" gpu_layers="" flash_attn="" cache_type_k="" cache_type_v="" swa_full="" batch_size="" ubatch_size=""
+  local temperature="" top_p="" top_k="" min_p="" repeat_penalty=""
+  local port="" parallel_slots="" slot_save_path="" cache_ram=""
+  local use_saved=false
+
+  if $is_remote; then
+    # ========================================================================
+    # Remote: ask model path, configure, generate one-liner, poll, connect
+    # ========================================================================
+
+    echo "" >&2
+    echo "Remote llama-server target: $llama_host" >&2
+    echo "" >&2
+    chosen_path=$(ask "Model path on $llama_host" "")
+    if [[ -z "$chosen_path" ]]; then
+      echo "Model path is required." >&2
+      exit 1
+    fi
+    local _fname="${chosen_path:t}"
+    model_id="${_fname%.gguf}"
+    profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
+
+    if [[ -f "$profile" ]]; then
+      echo "" >&2
+      echo "Saved profile for $model_id:" >&2
+      echo "" >&2
+      echo "  Loading:" >&2
+      printf "    %-20s %s\n" "Model path:" "$(jq -r '.model_path' "$profile")" >&2
+      printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
+      printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
+      printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
+      printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
+      printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
+      printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
+      printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
+      printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
+      echo "  Sampling:" >&2
+      printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
+      printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
+      printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
+      printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
+      printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
+      echo "  Server:" >&2
+      printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
+      printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
+      printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
+      echo "" >&2
+      printf "Use saved profile? (Y/n): " >&2
+      read -r use_reply
+      [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_saved=true
+    fi
+
+    if $use_saved; then
+      ctx_len=$(jq -r '.ctx_len' "$profile")
+      gpu_layers=$(jq -r '.gpu_layers' "$profile")
+      flash_attn=$(jq -r '.flash_attn' "$profile")
+      cache_type_k=$(jq -r '.cache_type_k' "$profile")
+      cache_type_v=$(jq -r '.cache_type_v' "$profile")
+      swa_full=$(jq -r '.swa_full' "$profile")
+      batch_size=$(jq -r '.batch_size' "$profile")
+      ubatch_size=$(jq -r '.ubatch_size' "$profile")
+      temperature=$(jq -r '.temperature' "$profile")
+      top_p=$(jq -r '.top_p' "$profile")
+      top_k=$(jq -r '.top_k' "$profile")
+      min_p=$(jq -r '.min_p' "$profile")
+      repeat_penalty=$(jq -r '.repeat_penalty' "$profile")
+      port=$(jq -r '.port' "$profile")
+      parallel_slots=$(jq -r '.parallel_slots' "$profile")
+      slot_save_path=$(jq -r '.slot_save_path // ""' "$profile")
+      cache_ram=$(jq -r '.cache_ram // ""' "$profile")
+    else
+      local d_ctx="65536" d_ngl="99" d_fa="on" d_ctk="q8_0" d_ctv="q8_0"
+      local d_swa="true" d_bs="4096" d_ubs="1024"
+      local d_temp="0.6" d_topp="0.95" d_topk="20" d_minp="0.00" d_rp="1.0"
+      local d_port="8081" d_np="1" d_ssp="" d_cram=""
+
+      if [[ -f "$profile" ]]; then
+        d_ctx=$(jq -r '.ctx_len' "$profile")
+        d_ngl=$(jq -r '.gpu_layers' "$profile")
+        d_fa=$(jq -r '.flash_attn' "$profile")
+        d_ctk=$(jq -r '.cache_type_k' "$profile")
+        d_ctv=$(jq -r '.cache_type_v' "$profile")
+        d_swa=$(jq -r '.swa_full' "$profile")
+        d_bs=$(jq -r '.batch_size' "$profile")
+        d_ubs=$(jq -r '.ubatch_size' "$profile")
+        d_temp=$(jq -r '.temperature' "$profile")
+        d_topp=$(jq -r '.top_p' "$profile")
+        d_topk=$(jq -r '.top_k' "$profile")
+        d_minp=$(jq -r '.min_p' "$profile")
+        d_rp=$(jq -r '.repeat_penalty' "$profile")
+        d_port=$(jq -r '.port' "$profile")
+        d_np=$(jq -r '.parallel_slots' "$profile")
+        d_ssp=$(jq -r '.slot_save_path // ""' "$profile")
+        d_cram=$(jq -r '.cache_ram // ""' "$profile")
+      fi
+
+      echo "" >&2
+      echo "Configure llama-server parameters (press Enter for default):" >&2
+      echo "" >&2
+      echo "  Loading:" >&2
+      ctx_len=$(ask "Context length" "$d_ctx")
+      gpu_layers=$(ask "GPU layers" "$d_ngl")
+      flash_attn=$(ask "Flash attention" "$d_fa")
+      cache_type_k=$(ask "KV cache type K" "$d_ctk")
+      cache_type_v=$(ask "KV cache type V" "$d_ctv")
+      swa_full=$(ask "SWA full" "$d_swa")
+      batch_size=$(ask "Batch size" "$d_bs")
+      ubatch_size=$(ask "Ubatch size" "$d_ubs")
+      echo "" >&2
+      echo "  Sampling:" >&2
+      temperature=$(ask "Temperature" "$d_temp")
+      top_p=$(ask "Top-P" "$d_topp")
+      top_k=$(ask "Top-K" "$d_topk")
+      min_p=$(ask "Min-P" "$d_minp")
+      repeat_penalty=$(ask "Repeat penalty" "$d_rp")
+      echo "" >&2
+      echo "  Server:" >&2
+      port=$(ask "Port" "$d_port")
+      parallel_slots=$(ask "Parallel slots" "$d_np")
+      slot_save_path=$(ask "Slot save path on remote" "$d_ssp")
+      cache_ram=$(ask "Cache RAM (MB)" "$d_cram")
+
+      jq -n \
+        --arg ctx "$ctx_len" --arg ngl "$gpu_layers" --arg fa "$flash_attn" \
+        --arg ctk "$cache_type_k" --arg ctv "$cache_type_v" --arg swa "$swa_full" \
+        --arg bs "$batch_size" --arg ubs "$ubatch_size" \
+        --arg temp "$temperature" --arg tp "$top_p" --arg tk "$top_k" \
+        --arg mp "$min_p" --arg rp "$repeat_penalty" \
+        --arg port "$port" --arg np "$parallel_slots" \
+        --arg ssp "$slot_save_path" --arg cram "$cache_ram" \
+        --arg model "$model_id" --arg path "$chosen_path" \
+        '{
+          model: $model, model_path: $path,
+          ctx_len: $ctx, gpu_layers: $ngl, flash_attn: $fa,
+          cache_type_k: $ctk, cache_type_v: $ctv, swa_full: $swa,
+          batch_size: $bs, ubatch_size: $ubs,
+          temperature: $temp, top_p: $tp, top_k: $tk, min_p: $mp, repeat_penalty: $rp,
+          port: $port, parallel_slots: $np,
+          slot_save_path: (if $ssp == "" then null else $ssp end),
+          cache_ram: (if $cram == "" then null else $cram end)
+        }' > "$profile"
+      echo "" >&2
+      echo "Profile saved." >&2
+    fi
+
+    # Print one-liner
+    echo "" >&2
+    echo "  ────────────────────────────────────────────────────────────────" >&2
+    echo "  Run this on $llama_host:" >&2
+    echo "" >&2
+    printf "  llama-server \\\\\n" >&2
+    printf "    -m \"%s\" \\\\\n" "$chosen_path" >&2
+    printf "    -c %s -ngl %s \\\\\n" "$ctx_len" "$gpu_layers" >&2
+    [[ -n "$flash_attn" ]] && printf "    --flash-attn %s \\\\\n" "$flash_attn" >&2
+    printf "    --cache-type-k %s --cache-type-v %s \\\\\n" "$cache_type_k" "$cache_type_v" >&2
+    [[ "$swa_full" == "true" ]] && printf "    --swa-full \\\\\n" >&2
+    printf "    -b %s -ub %s \\\\\n" "$batch_size" "$ubatch_size" >&2
+    printf "    --temp %s --top-p %s --top-k %s --min-p %s --repeat-penalty %s \\\\\n" \
+      "$temperature" "$top_p" "$top_k" "$min_p" "$repeat_penalty" >&2
+    printf "    --port %s -np %s \\\\\n" "$port" "$parallel_slots" >&2
+    [[ -n "$slot_save_path" ]] && printf "    --slot-save-path \"%s\" \\\\\n" "$slot_save_path" >&2
+    [[ -n "$cache_ram" ]] && printf "    --cache-ram %s \\\\\n" "$cache_ram" >&2
+    printf "    --jinja --metrics --host 0.0.0.0\n" >&2
+    echo "" >&2
+    echo "  ────────────────────────────────────────────────────────────────" >&2
+
+    # Check if already running, or poll until ready
+    local remote_health="http://${llama_host}:${port}/health"
+    if curl -sf --max-time 3 "$remote_health" 2>/dev/null | jq -e '.status == "ok"' > /dev/null 2>&1; then
+      echo "" >&2
+      echo "Remote server is already running. Connecting..." >&2
+    else
+      echo "" >&2
+      printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$llama_host" "$port" >&2
+      local waited=0 timeout=300
+      while (( waited < timeout )); do
+        if curl -sf --max-time 2 "$remote_health" 2>/dev/null | jq -e '.status == "ok"' > /dev/null 2>&1; then
+          echo " ready." >&2
+          break
+        fi
+        printf "." >&2
+        sleep 5
+        waited=$((waited + 5))
+      done
+      if (( waited >= timeout )); then
+        echo "" >&2
+        echo "Timed out (${timeout}s)." >&2
+        exit 1
+      fi
+    fi
+
+    # Read actual context window from server (overrides profile — server may have been started with different -c)
+    local actual_ctx
+    actual_ctx=$(curl -sf --max-time 3 "http://${llama_host}:${port}/slots" 2>/dev/null | jq -r '.[0].n_ctx // empty')
+    if [[ -n "$actual_ctx" && "$actual_ctx" != "$ctx_len" ]]; then
+      echo "  Context: profile has ${ctx_len}, server reports ${actual_ctx} — using ${actual_ctx}" >&2
+      ctx_len="$actual_ctx"
+    fi
+
+    launch_claude exec "$model_id" "$llama_host" "$port" "$ctx_len" "${passthrough_args[@]}"
+    return
+  fi
+
+  # ========================================================================
+  # Local: scan GGUF files, configure, start llama-server, connect
+  # ========================================================================
+
+  if [[ ! -d "$MODELS_DIR" ]]; then
+    echo "Models directory not found: $MODELS_DIR" >&2
+    exit 1
+  fi
+
+  local gguf_files=()
+  local gguf_sizes=()
+  local gguf_dirs=()
+
+  while IFS= read -r -d '' fpath; do
+    gguf_files+=("$fpath")
+    gguf_sizes+=("$(_stat_size "$fpath")")
+    gguf_dirs+=("$(basename "$(dirname "$(dirname "$fpath")")")")
+  done < <(find "$MODELS_DIR" -name "*.gguf" -not -name "mmproj*" -print0 | sort -z)
+
+  local model_count=${#gguf_files[@]}
+  if (( model_count == 0 )); then
+    echo "No GGUF models found in $MODELS_DIR" >&2
+    exit 1
+  fi
+
+  echo "" >&2
+  echo "Available GGUF models:" >&2
+  echo "" >&2
+  local fname hsize pdir saved_tag name_no_ext
+  for ((i=0; i<model_count; i++)); do
+    saved_tag=""
+    fname="${gguf_files[$((i+1))]:t}"
+    hsize=$(human_size "${gguf_sizes[$((i+1))]}")
+    pdir="${gguf_dirs[$((i+1))]}"
+    name_no_ext="${fname%.gguf}"
+    [[ -f "$CONFIG_DIR/llama-$(slug "$name_no_ext").json" ]] && saved_tag=" *"
+    printf "  %2d) %-42s %8s  (%s)%s\n" $((i+1)) "$fname" "$hsize" "$pdir" "$saved_tag" >&2
+  done
+  echo "" >&2
+  echo "  (* = saved profile)" >&2
+  echo "" >&2
+
+  printf "Select model (1-%d): " "$model_count" >&2
+  read -r selection
+
+  if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > model_count )); then
+    echo "Invalid selection." >&2
+    exit 1
+  fi
+
+  chosen_path="${gguf_files[$selection]}"
+  chosen_fname="${chosen_path:t}"
+  model_id="${chosen_fname%.gguf}"
+  model_dir="${chosen_path:h}"
+  profile="$CONFIG_DIR/llama-$(slug "$model_id").json"
+
+  # --- mmproj detection (optional) ---
+  mmproj_match=$(find "$model_dir" -name "mmproj*.gguf" -print -quit 2>/dev/null)
+  if [[ -n "$mmproj_match" ]]; then
+    echo "" >&2
+    echo "Multimodal projector found: ${mmproj_match:t}" >&2
+    echo "  Note: enabling mmproj disables slot save/restore (KV cache persistence)." >&2
+    printf "  Load mmproj? (y/N): " >&2
+    read -r mmproj_reply
+    if [[ "$mmproj_reply" =~ ^[Yy]$ ]]; then
+      mmproj_path="$mmproj_match"
+    fi
+  fi
+
+  # --- Profile load or configure ---
+  if [[ -f "$profile" ]]; then
+    echo "" >&2
+    echo "Saved profile for $model_id:" >&2
+    echo "" >&2
+    echo "  Loading:" >&2
+    printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
+    printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
+    printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
+    printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
+    printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
+    printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
+    printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
+    printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
+    echo "  Sampling:" >&2
+    printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
+    printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
+    printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
+    printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
+    printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
+    echo "  Server:" >&2
+    printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
+    printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
+    printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
+    printf "    %-20s %s\n" "Cache RAM (MB):" "$(jq -r '.cache_ram // ""' "$profile")" >&2
+    echo "" >&2
+    printf "Use saved profile? (Y/n): " >&2
+    read -r use_reply
+    if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
+      use_saved=true
+    fi
+  fi
+
+  if $use_saved; then
+    ctx_len=$(jq -r '.ctx_len' "$profile")
+    gpu_layers=$(jq -r '.gpu_layers' "$profile")
+    flash_attn=$(jq -r '.flash_attn' "$profile")
+    cache_type_k=$(jq -r '.cache_type_k' "$profile")
+    cache_type_v=$(jq -r '.cache_type_v' "$profile")
+    swa_full=$(jq -r '.swa_full' "$profile")
+    batch_size=$(jq -r '.batch_size' "$profile")
+    ubatch_size=$(jq -r '.ubatch_size' "$profile")
+    temperature=$(jq -r '.temperature' "$profile")
+    top_p=$(jq -r '.top_p' "$profile")
+    top_k=$(jq -r '.top_k' "$profile")
+    min_p=$(jq -r '.min_p' "$profile")
+    repeat_penalty=$(jq -r '.repeat_penalty' "$profile")
+    port=$(jq -r '.port' "$profile")
+    parallel_slots=$(jq -r '.parallel_slots' "$profile")
+    slot_save_path=$(jq -r '.slot_save_path // ""' "$profile")
+    cache_ram=$(jq -r '.cache_ram // ""' "$profile")
+  else
+    local d_ctx="65536" d_ngl="99" d_fa="on" d_ctk="q8_0" d_ctv="q8_0"
+    local d_swa="true" d_bs="4096" d_ubs="1024"
+    local d_temp="0.6" d_topp="0.95" d_topk="20" d_minp="0.00" d_rp="1.0"
+    local d_port="8081" d_np="1" d_ssp="$HOME/.cache/cclm/slots" d_cram=""
+
+    if [[ -f "$profile" ]]; then
+      d_ctx=$(jq -r '.ctx_len' "$profile")
+      d_ngl=$(jq -r '.gpu_layers' "$profile")
+      d_fa=$(jq -r '.flash_attn' "$profile")
+      d_ctk=$(jq -r '.cache_type_k' "$profile")
+      d_ctv=$(jq -r '.cache_type_v' "$profile")
+      d_swa=$(jq -r '.swa_full' "$profile")
+      d_bs=$(jq -r '.batch_size' "$profile")
+      d_ubs=$(jq -r '.ubatch_size' "$profile")
+      d_temp=$(jq -r '.temperature' "$profile")
+      d_topp=$(jq -r '.top_p' "$profile")
+      d_topk=$(jq -r '.top_k' "$profile")
+      d_minp=$(jq -r '.min_p' "$profile")
+      d_rp=$(jq -r '.repeat_penalty' "$profile")
+      d_port=$(jq -r '.port' "$profile")
+      d_np=$(jq -r '.parallel_slots' "$profile")
+      d_ssp=$(jq -r '.slot_save_path // ""' "$profile")
+      d_cram=$(jq -r '.cache_ram // ""' "$profile")
+    fi
+
+    echo "" >&2
+    echo "Configure llama-server parameters (press Enter for default):" >&2
+
+    echo "" >&2
+    echo "  Loading:" >&2
+    ctx_len=$(ask "Context length" "$d_ctx")
+    gpu_layers=$(ask "GPU layers" "$d_ngl")
+    flash_attn=$(ask "Flash attention" "$d_fa")
+    cache_type_k=$(ask "KV cache type K" "$d_ctk")
+    cache_type_v=$(ask "KV cache type V" "$d_ctv")
+    swa_full=$(ask "SWA full" "$d_swa")
+    batch_size=$(ask "Batch size" "$d_bs")
+    ubatch_size=$(ask "Ubatch size" "$d_ubs")
+
+    echo "" >&2
+    echo "  Sampling:" >&2
+    temperature=$(ask "Temperature" "$d_temp")
+    top_p=$(ask "Top-P" "$d_topp")
+    top_k=$(ask "Top-K" "$d_topk")
+    min_p=$(ask "Min-P" "$d_minp")
+    repeat_penalty=$(ask "Repeat penalty" "$d_rp")
+
+    echo "" >&2
+    echo "  Server:" >&2
+    port=$(ask "Port" "$d_port")
+    parallel_slots=$(ask "Parallel slots" "$d_np")
+    slot_save_path=$(ask "Slot save path" "$d_ssp")
+    cache_ram=$(ask "Cache RAM (MB)" "$d_cram")
+
+    jq -n \
+      --arg ctx "$ctx_len" \
+      --arg ngl "$gpu_layers" \
+      --arg fa "$flash_attn" \
+      --arg ctk "$cache_type_k" \
+      --arg ctv "$cache_type_v" \
+      --arg swa "$swa_full" \
+      --arg bs "$batch_size" \
+      --arg ubs "$ubatch_size" \
+      --arg temp "$temperature" \
+      --arg tp "$top_p" \
+      --arg tk "$top_k" \
+      --arg mp "$min_p" \
+      --arg rp "$repeat_penalty" \
+      --arg port "$port" \
+      --arg np "$parallel_slots" \
+      --arg ssp "$slot_save_path" \
+      --arg cram "$cache_ram" \
+      --arg model "$model_id" \
+      --arg path "$chosen_path" \
+      '{
+        model: $model,
+        model_path: $path,
+        ctx_len: $ctx,
+        gpu_layers: $ngl,
+        flash_attn: $fa,
+        cache_type_k: $ctk,
+        cache_type_v: $ctv,
+        swa_full: $swa,
+        batch_size: $bs,
+        ubatch_size: $ubs,
+        temperature: $temp,
+        top_p: $tp,
+        top_k: $tk,
+        min_p: $mp,
+        repeat_penalty: $rp,
+        port: $port,
+        parallel_slots: $np,
+        slot_save_path: (if $ssp == "" then null else $ssp end),
+        cache_ram: (if $cram == "" then null else $cram end)
+      }' > "$profile"
+
+    echo "" >&2
+    echo "Profile saved to $profile" >&2
+  fi
+
+  # --- Port conflict check ---
+  if lsof -i ":${port}" -sTCP:LISTEN > /dev/null 2>&1; then
+    echo "" >&2
+    echo "Port ${port} is already in use." >&2
+    local pid_on_port
+    pid_on_port=$(lsof -ti ":${port}" -sTCP:LISTEN 2>/dev/null | head -1)
+    printf "Kill process %s and continue? (y/N): " "$pid_on_port" >&2
+    read -r kill_reply
+    if [[ "$kill_reply" =~ ^[Yy]$ ]]; then
+      kill "$pid_on_port" 2>/dev/null || true
+      sleep 1
+    else
+      echo "Aborted." >&2
+      exit 1
+    fi
+  fi
+
+  # Build llama-server command
+  local server_args=(
+    "-m" "$chosen_path"
+    "-c" "$ctx_len"
+    "-ngl" "$gpu_layers"
+    "--cache-type-k" "$cache_type_k"
+    "--cache-type-v" "$cache_type_v"
+    "-b" "$batch_size"
+    "-ub" "$ubatch_size"
+    "--temp" "$temperature"
+    "--top-p" "$top_p"
+    "--top-k" "$top_k"
+    "--min-p" "$min_p"
+    "--repeat-penalty" "$repeat_penalty"
+    "--port" "$port"
+    "-np" "$parallel_slots"
+    "--jinja"
+    "--metrics"
+  )
+
+  [[ -n "$flash_attn" ]] && server_args+=("--flash-attn" "$flash_attn")
+  [[ "$swa_full" == "true" ]] && server_args+=("--swa-full")
+  if [[ -n "$slot_save_path" ]]; then
+    slot_save_path="${slot_save_path/#\~/$HOME}"
+    mkdir -p "$slot_save_path"
+    server_args+=("--slot-save-path" "$slot_save_path")
+  fi
+  [[ -n "$cache_ram" ]] && server_args+=("--cache-ram" "$cache_ram")
+  [[ -n "$mmproj_path" ]] && server_args+=("--mmproj" "$mmproj_path")
+
+  # Start server
+  LLAMA_PID=""
+  trap 'if [[ -n "${LLAMA_PID:-}" ]]; then kill "$LLAMA_PID" 2>/dev/null; wait "$LLAMA_PID" 2>/dev/null; fi' EXIT INT TERM
+
+  echo "" >&2
+  echo "Starting llama-server..." >&2
+  echo "  Model: $model_id" >&2
+  echo "  Port:  $port" >&2
+  [[ -n "$mmproj_path" ]] && echo "  mmproj: ${mmproj_path:t}" >&2
+
+  local server_log="/tmp/cclm-llama-server.log"
+  llama-server "${server_args[@]}" > "$server_log" 2>&1 &
+  LLAMA_PID=$!
+
+  # Wait for health
+  local health_url="http://localhost:${port}/health"
+  local waited=0
+  local timeout=120
+
+  printf "Waiting for llama-server to load model..." >&2
+  while (( waited < timeout )); do
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+      echo "" >&2
+      echo "llama-server exited unexpectedly. Check log: $server_log" >&2
+      tail -5 "$server_log" >&2
+      exit 1
+    fi
+    if curl -s "$health_url" 2>/dev/null | jq -e '.status == "ok"' > /dev/null 2>&1; then
+      echo " ready." >&2
+      break
+    fi
+    printf "." >&2
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  if (( waited >= timeout )); then
+    echo "" >&2
+    echo "Timed out waiting for llama-server (${timeout}s). Check log: $server_log" >&2
+    tail -10 "$server_log" >&2
+    kill "$LLAMA_PID" 2>/dev/null || true
+    exit 1
+  fi
+
+  launch_claude fg "$model_id" "$llama_host" "$port" "$ctx_len" "${passthrough_args[@]}"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+case "$backend" in
+  lms)   run_lms ;;
+  llama) run_llama ;;
+esac
