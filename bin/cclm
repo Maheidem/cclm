@@ -123,10 +123,18 @@ launch_claude() {
   # Per-tier routing: backends that support distinct models per Claude tier
   # (Z.ai) set CCLM_TIER_OPUS / CCLM_TIER_SONNET / CCLM_TIER_HAIKU. Local backends
   # leave them unset, so all three tiers collapse to $api_id (single loaded model).
-  export ANTHROPIC_DEFAULT_OPUS_MODEL="${CCLM_TIER_OPUS:-$api_id}"
-  export ANTHROPIC_DEFAULT_SONNET_MODEL="${CCLM_TIER_SONNET:-$api_id}"
-  export ANTHROPIC_DEFAULT_HAIKU_MODEL="${CCLM_TIER_HAIKU:-$api_id}"
-  export CLAUDE_CODE_SUBAGENT_MODEL="${CCLM_TIER_HAIKU:-$api_id}"
+
+  # Apply [1m] suffix to the resolved model names so Claude Code uses
+  # a 1M context ceiling instead of the 200K default for standard models.
+  # Local backends ignore the model field; cloud backends (Z/remote)
+  # already have large capacities but Claude Code still caps them at 200K.
+  export _CCLM_FAKE_OPUS="${CCLM_TIER_OPUS:-$api_id}[1m]"
+  export _CCLM_FAKE_SONNET="${CCLM_TIER_SONNET:-$api_id}[1m]"
+  export _CCLM_FAKE_HAIKU="${CCLM_TIER_HAIKU:-$api_id}[1m]"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$_CCLM_FAKE_OPUS"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$_CCLM_FAKE_SONNET"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$_CCLM_FAKE_HAIKU"
+  export CLAUDE_CODE_SUBAGENT_MODEL="$_CCLM_FAKE_HAIKU"
 
   export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx"
   export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$ctx"
@@ -143,15 +151,15 @@ launch_claude() {
   export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING="1"
 
   echo "" >&2
-  echo "Model:   $api_id" >&2
+  echo "Model:   $_CCLM_FAKE_SONNET" >&2
   echo "Backend: $ANTHROPIC_BASE_URL" >&2
   echo "Context: ${ctx} tokens  (CLAUDE_CODE_AUTO_COMPACT_WINDOW=${ctx})" >&2
   echo "" >&2
 
   if [[ "$mode" == "exec" ]]; then
-    exec claude --model "$api_id" "$@"
+    exec claude --model "$_CCLM_FAKE_SONNET" "$@"
   else
-    claude --model "$api_id" "$@"
+    claude --model "$_CCLM_FAKE_SONNET" "$@"
   fi
 }
 
