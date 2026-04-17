@@ -78,7 +78,35 @@ cclm --remote              # generic OpenAI-compatible remote
 cclm --ollama              # Ollama (OpenAI-compatible; default port 11434)
 cclm --host <ip_or_name>   # remote host for --lms / --llama
 cclm --llama --resume      # any unknown arg is passed through to claude
+cclm status                # health report (last session, profiles, backend reachability) — does not launch claude
 ```
+
+### Status (`cclm status`)
+
+Prints a non-interactive health report and exits — useful for quick checks or piping into scripts:
+
+```
+Last session:
+  backend:      llama
+  profile:      llama-qwen3-27b.json
+  model:        Qwen3.5-27B
+  remote_host:  192.168.1.100
+
+Saved profiles (grouped by backend):
+  [lms] (2)
+    - qwen3-27b                              ctx:131072
+    - gemma-4-e2b                            ctx:65536
+  [llama] (1)
+    - qwen3-27b                              ctx:262144
+
+Backend reachability:
+  localhost:1234                           ✓ UP
+  localhost:8081                           ✗ DOWN
+  localhost:11434                          ✗ DOWN
+  192.168.1.100:8081                       ✓ UP
+```
+
+Section headers go to stderr; data rows to stdout, so `cclm status | grep UP` works. Probes use a 1s timeout per endpoint and never hard-fail if a backend is down.
 
 ### Profile picker
 
@@ -116,6 +144,27 @@ Actions:
 ### Resume last session
 
 On the backend picker, if there is a recorded previous session, option `0) Resume last session` appears — selecting it re-dispatches to that backend against the previously-used remote host and model. State lives at `~/.config/cclm/.last_session`.
+
+### Session log
+
+Every real launch (not `--dry-run`) appends one JSONL record to `~/.cache/cclm/sessions.log` with:
+
+```json
+{"ts_start":"2026-04-17T14:32:11Z","backend":"llama","profile_basename":"llama-qwen3.json","host":"localhost","model":"qwen3","pid":12345}
+```
+
+Only `ts_start` is recorded. `cclm` ends with `exec claude`, which replaces the current process — nothing can run after that, so there is no `ts_end`. The log is append-only; cclm never rotates or deletes entries.
+
+Summarize with `cclm log`:
+
+```bash
+cclm log                    # last 10 sessions, tabular
+cclm log --last 7d          # filter to sessions within the last N days
+cclm log --profile qwen3    # substring match against profile_basename
+cclm log --json             # dump raw JSONL (combines with filters above)
+```
+
+If the log file does not exist yet, `cclm log` prints `No sessions logged yet.` and exits 0. Override the log location with `CCLM_CACHE_DIR=/some/path` (the file is always `$CCLM_CACHE_DIR/sessions.log`).
 
 ### Classic flow
 

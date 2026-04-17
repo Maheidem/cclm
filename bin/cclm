@@ -235,6 +235,30 @@ save_last_session() {
   return 0
 }
 
+# Append-only session log. JSONL at $SESSION_LOG_FILE. One line per launch.
+# NOTE: we can only record ts_start — `launch_claude` ends with `exec claude`,
+# which replaces the process, so no post-run hook can write ts_end. Rotation
+# is intentionally not implemented; leave that for future.
+SESSION_LOG_DIR="${CCLM_CACHE_DIR:-$HOME/.cache/cclm}"
+SESSION_LOG_FILE="$SESSION_LOG_DIR/sessions.log"
+
+log_session() {
+  local backend="$1" host="$2" model="$3" profile_basename="$4"
+  mkdir -p "$SESSION_LOG_DIR" 2>/dev/null || return 0
+  local ts_start
+  ts_start=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  jq -n -c \
+    --arg ts "$ts_start" \
+    --arg be "$backend" \
+    --arg prof "$profile_basename" \
+    --arg host "$host" \
+    --arg model "$model" \
+    --arg pid "$$" \
+    '{ts_start: $ts, backend: $be, profile_basename: $prof, host: $host, model: $model, pid: ($pid|tonumber)}' \
+    >> "$SESSION_LOG_FILE" 2>/dev/null || true
+  return 0
+}
+
 # Set env vars and launch claude. Args: mode, api_id, host, port, context_length, extra_claude_args...
 # mode is "exec" (replaces process) or "fg" (foreground, returns when done)
 launch_claude() {
@@ -308,11 +332,23 @@ launch_claude() {
 
   # --dry-run / --print-env: print the env vars cclm manages and the command
   # that WOULD have been exec'd, then exit 0 without invoking claude.
+  # Do NOT log dry-runs — only real launches are recorded.
   if [[ "${DRY_RUN:-false}" == "true" ]]; then
     env | grep -E '^(ANTHROPIC|CCLM|CLAUDE_CODE)_' | sort
     print -r -- "claude --model ${(q)_CCLM_FAKE_SONNET} ${(q-)@}"
     exit 0
   fi
+
+  # Append-only session log. Reads backend/profile from the just-written
+  # STATE_FILE (all backends call save_last_session immediately before
+  # launch_claude, so the file is fresh). exec-replaces-process means we
+  # cannot record ts_end — see log_session docs.
+  local _log_backend="" _log_profile=""
+  if [[ -f "$STATE_FILE" ]]; then
+    _log_backend=$(jq -r '.backend // ""' "$STATE_FILE" 2>/dev/null || true)
+    _log_profile=$(jq -r '.profile // ""' "$STATE_FILE" 2>/dev/null || true)
+  fi
+  log_session "$_log_backend" "$host" "$api_id" "$_log_profile"
 
   if [[ "$mode" == "exec" ]]; then
     exec claude --model "$_CCLM_FAKE_SONNET" "$@"
@@ -432,6 +468,333 @@ run_ollama() {
   launch_claude exec "$o_model" "$o_host" "$o_port" "$o_ctx" "${passthrough_args[@]}"
 }
 
+# ============================================================================
+# `cclm log` subcommand
+# ============================================================================
+# Summarize the append-only session log at $SESSION_LOG_FILE.
+#   cclm log                       — last 10 sessions (tabular)
+#   cclm log --last 7d             — filter to sessions within last N days
+#   cclm log --profile <slug>      — filter to sessions matching profile basename
+#                                    (substring match, so `foo` matches `lms-foo.json`)
+#   cclm log --json                — dump raw JSONL (filtered, if combined with above)
+#
+# Date handling: ts_start is written as ISO-8601 UTC (date -u +"%Y-%m-%dT%H:%M:%SZ").
+# The `--last Nd` filter parses this exact format with zsh string ops — no locale-
+# dependent `date -d`/`date -f` involved, so behavior is identical across macOS/Linux.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+cmd_log() {
+  local last_filter="" profile_filter="" as_json=false
+
+  while (( $# )); do
+    case "$1" in
+      --last)
+        [[ $# -ge 2 ]] || { echo "--last requires an argument (e.g. 7d)" >&2; return 2; }
+        last_filter="$2"; shift ;;
+      --last=*) last_filter="${1#--last=}" ;;
+      --profile)
+        [[ $# -ge 2 ]] || { echo "--profile requires an argument" >&2; return 2; }
+        profile_filter="$2"; shift ;;
+      --profile=*) profile_filter="${1#--profile=}" ;;
+      --json) as_json=true ;;
+      -h|--help)
+        cat >&2 <<'EOF'
+Usage: cclm log [--last Nd] [--profile <slug>] [--json]
+
+Summarize the session log at ~/.cache/cclm/sessions.log.
+Records ts_start only (cclm exec-replaces into claude, so ts_end cannot be captured).
+EOF
+        return 0 ;;
+      *) echo "Unknown option: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  if [[ ! -f "$SESSION_LOG_FILE" ]]; then
+    echo "No sessions logged yet."
+    return 0
+  fi
+
+  # Build a jq filter pipeline. Each stage is a no-op unless a flag is set.
+  local jq_filter='.'
+
+  # --last Nd: compute cutoff as "now - N days" in ISO-8601 UTC and
+  # keep entries whose ts_start is lexicographically >= cutoff. Lex
+  # compare is valid because ISO-8601 UTC strings sort chronologically.
+  if [[ -n "$last_filter" ]]; then
+    if [[ ! "$last_filter" =~ ^[0-9]+d$ ]]; then
+      echo "--last must look like '7d' (N days)" >&2
+      return 2
+    fi
+    local days="${last_filter%d}"
+    local cutoff
+    # BSD date (macOS) uses -v; GNU date uses -d. Try BSD first, then GNU.
+    if cutoff=$(date -u -v-${days}d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null); then
+      :
+    elif cutoff=$(date -u -d "${days} days ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null); then
+      :
+    else
+      echo "Could not compute cutoff date." >&2
+      return 1
+    fi
+    jq_filter="${jq_filter} | select(.ts_start >= \"${cutoff}\")"
+  fi
+
+  if [[ -n "$profile_filter" ]]; then
+    # Substring match — user may pass slug or full basename.
+    jq_filter="${jq_filter} | select(.profile_basename | contains(\"${profile_filter}\"))"
+  fi
+
+  if $as_json; then
+    jq -c "$jq_filter" "$SESSION_LOG_FILE" 2>/dev/null
+    return 0
+  fi
+
+  # Table mode: apply filter, then tail last 10, reformat.
+  local rows
+  rows=$(jq -c "$jq_filter" "$SESSION_LOG_FILE" 2>/dev/null | tail -10)
+  if [[ -z "$rows" ]]; then
+    echo "No sessions match."
+    return 0
+  fi
+
+  printf "%-20s  %-7s  %-30s  %-25s  %s\n" "TIMESTAMP" "BACKEND" "PROFILE" "HOST" "MODEL"
+  # Feed the loop via heredoc instead of a pipe so it runs in the current
+  # shell. In zsh, a `while ... | done` pipeline puts the body in a subshell,
+  # and `local` there echoes variable assignments on subsequent iterations.
+  local line ts be prof host model
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    ts=$(echo "$line"     | jq -r '.ts_start // ""')
+    be=$(echo "$line"     | jq -r '.backend // ""')
+    prof=$(echo "$line"   | jq -r '.profile_basename // ""')
+    host=$(echo "$line"   | jq -r '.host // ""')
+    model=$(echo "$line"  | jq -r '.model // ""')
+    printf "%-20s  %-7s  %-30s  %-25s  %s\n" \
+      "${ts:0:19}" "$be" "${prof:0:30}" "${host:0:25}" "$model"
+  done <<< "$rows"
+  return 0
+}
+
+# ============================================================================
+# `cclm status` subcommand
+# ============================================================================
+# Prints a health report without launching claude:
+#   - last recorded session
+#   - saved profiles grouped by backend
+#   - reachability of every distinct host:port across profiles + defaults
+#   - LM Studio loaded models (when `lms` CLI is on PATH)
+# Section headers go to stderr; data rows go to stdout so it's pipe-safe.
+# Never hard-exits on probe failure — backends may legitimately be down.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+
+# Reachability probe against a base URL. Tries /v1/models first (LM Studio,
+# Ollama, OpenAI-compat) then falls back to /health (llama-server). Echoes
+# "UP" or "DOWN". Always returns 0 so callers under `set -e` aren't killed.
+_cclm_probe() {
+  local base="$1"
+  if curl -sf --max-time 1 "${base}/v1/models" >/dev/null 2>&1; then
+    echo "UP"
+  elif curl -sf --max-time 1 "${base}/health" >/dev/null 2>&1; then
+    echo "UP"
+  else
+    echo "DOWN"
+  fi
+  return 0
+}
+
+# Render a status marker: colorized on a TTY, plain text otherwise. Keeps
+# the literal "UP" / "DOWN" tokens in both paths so grep/tests work.
+_cclm_status_marker() {
+  local state="$1"
+  if [[ -t 1 ]]; then
+    if [[ "$state" == "UP" ]]; then
+      printf '\033[32m✓ UP\033[0m'
+    else
+      printf '\033[31m✗ DOWN\033[0m'
+    fi
+  else
+    if [[ "$state" == "UP" ]]; then
+      printf '✓ UP'
+    else
+      printf '✗ DOWN'
+    fi
+  fi
+}
+
+cmd_status() {
+  # Populate last_* globals (idempotent, always succeeds).
+  load_last_session
+
+  # --- Section 1: last session ---
+  echo "Last session:" >&2
+  if [[ -n "${last_backend:-}" || -n "${last_profile:-}" ]]; then
+    printf "  %-13s %s\n" "backend:"     "${last_backend:-(none)}"
+    printf "  %-13s %s\n" "profile:"     "${last_profile:-(none)}"
+    printf "  %-13s %s\n" "model:"       "${last_model:-(none)}"
+    printf "  %-13s %s\n" "remote_host:" "${last_remote:-local}"
+  else
+    echo "  (none)"
+  fi
+
+  # --- Section 2: saved profiles grouped by backend ---
+  echo "" >&2
+  echo "Saved profiles (grouped by backend):" >&2
+  local -a all_profiles
+  all_profiles=( "$CONFIG_DIR"/{lms,llama,zai,remote,ollama}-*.json(N) )
+  if (( ${#all_profiles[@]} == 0 )); then
+    echo "  (none)"
+  else
+    local be f base slug ctx count
+    local -a group
+    for be in lms llama zai remote ollama; do
+      group=( "$CONFIG_DIR"/${be}-*.json(N) )
+      count=${#group[@]}
+      (( count == 0 )) && continue
+      printf "  [%s] (%d)\n" "$be" "$count"
+      for f in "${group[@]}"; do
+        base="${f:t}"
+        # strip "<be>-" prefix and ".json" suffix → slug
+        slug="${base#${be}-}"
+        slug="${slug%.json}"
+        case "$be" in
+          llama) ctx=$(jq -r '.ctx_len // "?"' "$f" 2>/dev/null || echo "?") ;;
+          *)     ctx=$(jq -r '.context_length // "?"' "$f" 2>/dev/null || echo "?") ;;
+        esac
+        [[ -z "$ctx" || "$ctx" == "null" ]] && ctx="?"
+        printf "    - %-40s ctx:%s\n" "$slug" "$ctx"
+      done
+    done
+  fi
+
+  # --- Section 3: backend reachability ---
+  echo "" >&2
+  echo "Backend reachability:" >&2
+
+  # Associative set of distinct endpoints: localhost defaults + any host:port
+  # seen in profiles. zai uses full URLs and is stored as-is.
+  # NOTE: zsh preserves literal quotes in assoc subscripts like `h["k"]` — keys
+  # must come from a variable (`k=...; h[$k]=1`) to avoid leaking the quotes.
+  local -A endpoints
+  local k
+  k="localhost:1234";  endpoints[$k]=1     # LM Studio default
+  k="localhost:8081";  endpoints[$k]=1     # llama.cpp default
+  k="localhost:11434"; endpoints[$k]=1     # Ollama default
+
+  local pf pbase pbe h p rh zurl
+  for pf in "$CONFIG_DIR"/{lms,llama,zai,remote,ollama}-*.json(N); do
+    pbase="${pf:t}"
+    pbe="${pbase%%-*}"
+    case "$pbe" in
+      lms)
+        rh=$(jq -r '.remote_host // "localhost"' "$pf" 2>/dev/null || echo "localhost")
+        [[ -z "$rh" || "$rh" == "null" ]] && rh="localhost"
+        k="${rh}:1234"; endpoints[$k]=1
+        ;;
+      llama)
+        rh=$(jq -r '.remote_host // "localhost"' "$pf" 2>/dev/null || echo "localhost")
+        p=$(jq -r '.port // "8081"' "$pf" 2>/dev/null || echo "8081")
+        [[ -z "$rh" || "$rh" == "null" ]] && rh="localhost"
+        [[ -z "$p" || "$p" == "null" ]] && p="8081"
+        k="${rh}:${p}"; endpoints[$k]=1
+        ;;
+      remote|ollama)
+        h=$(jq -r '.host // "localhost"' "$pf" 2>/dev/null || echo "localhost")
+        p=$(jq -r '.port // ""' "$pf" 2>/dev/null || echo "")
+        [[ -z "$h" || "$h" == "null" ]] && h="localhost"
+        if [[ -z "$p" || "$p" == "null" ]]; then
+          [[ "$pbe" == "ollama" ]] && p="11434" || p="1234"
+        fi
+        k="${h}:${p}"; endpoints[$k]=1
+        ;;
+      zai)
+        zurl=$(jq -r '.base_url // empty' "$pf" 2>/dev/null || echo "")
+        if [[ -n "$zurl" && "$zurl" != "null" ]]; then
+          k="$zurl"; endpoints[$k]=1
+        fi
+        ;;
+    esac
+  done
+
+  local ep state base_url
+  for ep in "${(@k)endpoints}"; do
+    if [[ "$ep" =~ ^https?:// ]]; then
+      base_url="$ep"
+    else
+      base_url="http://${ep}"
+    fi
+    state=$(_cclm_probe "$base_url")
+    printf "  %-40s %s\n" "$ep" "$(_cclm_status_marker "$state")"
+  done
+
+  # --- Section 4: LM Studio loaded models (optional) ---
+  if command -v lms >/dev/null 2>&1; then
+    echo "" >&2
+    echo "LM Studio loaded models:" >&2
+    local lms_json lms_loaded line
+    lms_json=$(lms ps --json 2>/dev/null || echo "")
+    if [[ -n "$lms_json" ]]; then
+      lms_loaded=$(echo "$lms_json" | jq -r '.[]? | .modelKey // .identifier // .path // empty' 2>/dev/null || echo "")
+      if [[ -n "$lms_loaded" ]]; then
+        while IFS= read -r line; do
+          [[ -n "$line" ]] && printf "  - %s\n" "$line"
+        done <<< "$lms_loaded"
+      else
+        echo "  (none loaded)"
+      fi
+    else
+      echo "  (lms ps unavailable)"
+    fi
+  fi
+
+  return 0
+}
+
+# Detect a top-level shortcut arg: `cclm resume` or `cclm <profile-slug>`.
+# Sets _PRELOADED_PROFILE (absolute path), _PRELOADED_ACTION=open, and backend
+# globals so the main dispatch routes to run_<backend> via the preload
+# fast-path — no profile picker, no backend menu.
+#
+# Return codes:
+#   0 — shortcut matched; globals set, caller should shift $1 off the arg list
+#   1 — not a shortcut (flag, unknown slug, empty arg); caller falls through
+#   2 — `resume` requested but no last-session state exists; caller exits 1
+#
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+try_shortcut_dispatch() {
+  local arg="${1:-}"
+
+  # Empty or flag-like args are not shortcuts — let the normal parser see them.
+  [[ -z "$arg" || "$arg" == -* ]] && return 1
+
+  if [[ "$arg" == "resume" ]]; then
+    load_last_session
+    if [[ -z "$last_backend" || -z "$last_profile" ]]; then
+      return 2
+    fi
+    _PRELOADED_PROFILE="$CONFIG_DIR/$last_profile"
+    _PRELOADED_ACTION="open"
+    backend="$last_backend"
+    remote_host="${last_remote:-}"
+    return 0
+  fi
+
+  # Profile-slug shortcut: arg must have a known backend prefix AND a matching
+  # profile file. E.g. `cclm lms-qwen` -> $CONFIG_DIR/lms-qwen.json.
+  local prefix="${arg%%-*}"
+  case "$prefix" in
+    lms|llama|zai|remote|ollama) ;;
+    *) return 1 ;;
+  esac
+
+  local candidate="$CONFIG_DIR/${arg}.json"
+  [[ -f "$candidate" ]] || return 1
+
+  _PRELOADED_PROFILE="$candidate"
+  _PRELOADED_ACTION="open"
+  backend="$prefix"
+  return 0
+}
+
 # When sourced for tests (CCLM_LIB_ONLY=1), return here — helpers are defined,
 # main execution (migration, arg parsing, backend dispatch) is skipped.
 [[ "${CCLM_LIB_ONLY:-0}" == "1" ]] && return 0
@@ -463,6 +826,53 @@ backend=""
 remote_host=""
 DRY_RUN=false
 passthrough_args=()
+
+# Intercept subcommands BEFORE backend dispatch. These are cclm-internal
+# commands that don't launch claude (e.g. `cclm log`). Consume the leading
+# subcommand word and forward the rest to the handler, which exits.
+if [[ $# -ge 1 && "$1" == "log" ]]; then
+  shift
+  cmd_log "$@"
+  exit $?
+fi
+
+if [[ $# -ge 1 && "$1" == "status" ]]; then
+  shift
+  cmd_status "$@"
+  exit $?
+fi
+
+# Top-level shortcuts: `cclm resume` and `cclm <profile-slug>`. Both must
+# short-circuit the profile/backend pickers by pre-populating preload globals.
+# Explicit backend flags (--lms/--llama/...) take precedence — if any backend
+# flag appears anywhere in $@, we skip shortcut detection entirely and let the
+# normal arg parser drive dispatch.
+_PRELOADED_PROFILE=""
+_PRELOADED_ACTION=""
+_has_backend_flag=false
+for _a in "$@"; do
+  case "$_a" in
+    --lms|--llama|--zai|--remote|--ollama) _has_backend_flag=true; break ;;
+  esac
+done
+unset _a
+if (( $# >= 1 )) && ! $_has_backend_flag; then
+  # `set -e` is active, so we must guard the call — non-zero rc from the
+  # helper is part of its contract (1 = fall-through, 2 = resume-no-state),
+  # not a failure that should kill the script.
+  _sc_rc=0
+  try_shortcut_dispatch "$1" || _sc_rc=$?
+  case "$_sc_rc" in
+    0) shift ;;  # shortcut consumed $1; remaining args flow to passthrough
+    2)
+      echo "cclm: no previous session recorded — nothing to resume." >&2
+      exit 1
+      ;;
+    # rc=1: not a shortcut — fall through to normal arg parsing
+  esac
+  unset _sc_rc
+fi
+unset _has_backend_flag
 
 while (( $# )); do
   case "$1" in
@@ -631,7 +1041,10 @@ pick_profile() {
 }
 
 # --- Profile picker (runs first when no backend flag) ---
-_PRELOADED_PROFILE="" _PRELOADED_ACTION=""
+# Preload globals may already be populated by try_shortcut_dispatch (`cclm
+# resume` / `cclm <slug>`); only initialize if empty so we don't wipe them.
+: "${_PRELOADED_PROFILE:=}"
+: "${_PRELOADED_ACTION:=}"
 if [[ -z "$backend" ]] && pick_profile; then
   # backend was set by pick_profile — dispatch directly
   :
