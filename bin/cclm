@@ -535,89 +535,117 @@ launch_claude() {
 }
 
 # ============================================================================
-# Ollama Backend
+# Ollama / vLLM Backends (OpenAI-compatible)
 # ============================================================================
-# Ollama exposes an OpenAI-compatible API at http://<host>:11434/v1.
-# Shape mirrors run_remote() but defaults to port 11434 and tags profiles
-# as ollama-<slug>.json so they're distinguishable in the picker.
-# Defined above the CCLM_LIB_ONLY guard so unit tests can assert on its
+# Both backends speak OpenAI-compatible /v1 at their default ports
+# (ollama:11434, vllm:8000) and save profiles as `<tag>-<slug>.json`. The
+# shared flow lives in `_run_openai_compat`; per-backend wrappers pin only
+# the tag, default port, and extends-resolution flag.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can assert on their
 # existence without triggering backend execution.
 
-run_ollama() {
+# _run_openai_compat <tag> <default_port> <resolve_extends:0|1>
+#
+#   tag             — "ollama" | "vllm". Drives profile prefix, save_last_session
+#                     backend arg, _cclm_validate_endpoint tag, and display label.
+#   default_port    — Numeric default when profile/prompt omits port.
+#   resolve_extends — 1: pipe $_PRELOADED_PROFILE through _cclm_read_profile
+#                     (honors `extends` chain). 0: jq-read the raw file.
+#                     Kept as a flag to preserve the current divergence
+#                     between the two backends — not a cleanup target here.
+#
+# Claude passthrough args come from the global `passthrough_args` array
+# (populated during arg parsing), matching every other backend.
+_run_openai_compat() {
+  local tag="$1" default_port="$2" resolve_extends="$3"
+  # Pretty label for the endpoint prompt. Keep lowercase tag for [tag] headers
+  # and profile filenames; only the ask() prompt wants human casing.
+  local pretty
+  case "$tag" in
+    ollama) pretty="Ollama" ;;
+    vllm)   pretty="vLLM" ;;
+    *)      pretty="$tag" ;;
+  esac
+
   # --- Preload fast-path (from profile picker) ---
   if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
-    # Resolve the profile once (applies any `extends` chain) and re-point
-    # the jq reads at the resolved JSON. Falls back to the raw file if
-    # resolve fails so a typo in `extends` still surfaces as an error rather
-    # than silently corrupting the launch.
-    local resolved_file
-    resolved_file=$(mktemp -t cclm_resolved.XXXXXX) || {
-      echo "cclm: failed to create tmp file for profile resolve" >&2
-      return 1
-    }
-    # shellcheck disable=SC2064 — we want the resolved_file expanded now.
-    trap "rm -f '$resolved_file'" EXIT
-    if ! _cclm_read_profile "$_PRELOADED_PROFILE" > "$resolved_file" 2>/dev/null; then
-      # Re-run without suppression to surface the error, then fail.
-      _cclm_read_profile "$_PRELOADED_PROFILE" > /dev/null
+    # Source file for jq reads. When resolve_extends=1 we materialize the
+    # resolved JSON to a tmp file; otherwise we read the raw profile directly.
+    # Fall back to surfacing the resolve error rather than silently corrupting
+    # the launch if `extends` is malformed.
+    local src_file="$_PRELOADED_PROFILE"
+    local resolved_file=""
+    if [[ "$resolve_extends" == "1" ]]; then
+      resolved_file=$(mktemp -t cclm_resolved.XXXXXX) || {
+        echo "cclm: failed to create tmp file for profile resolve" >&2
+        return 1
+      }
+      # shellcheck disable=SC2064 — we want the resolved_file expanded now.
+      trap "rm -f '$resolved_file'" EXIT
+      if ! _cclm_read_profile "$_PRELOADED_PROFILE" > "$resolved_file" 2>/dev/null; then
+        # Re-run without suppression to surface the error, then fail.
+        _cclm_read_profile "$_PRELOADED_PROFILE" > /dev/null
+        rm -f "$resolved_file"
+        trap - EXIT
+        return 1
+      fi
+      src_file="$resolved_file"
+    fi
+
+    local _pl_host _pl_port _pl_model _pl_ctx
+    _pl_host=$(jq -r '.host // ""' "$src_file")
+    _pl_port=$(jq -r --arg dp "$default_port" '.port // $dp' "$src_file")
+    _pl_model=$(jq -r '.model // ""' "$src_file")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$src_file")
+
+    # Drop tmp file before `exec claude` in launch_claude so /tmp doesn't leak.
+    if [[ -n "$resolved_file" ]]; then
       rm -f "$resolved_file"
       trap - EXIT
-      return 1
     fi
-
-    local _pl_host _pl_port _pl_model _pl_ctx
-    _pl_host=$(jq -r '.host // ""' "$resolved_file")
-    _pl_port=$(jq -r '.port // "11434"' "$resolved_file")
-    _pl_model=$(jq -r '.model // ""' "$resolved_file")
-    _pl_ctx=$(jq -r '.context_length // "65536"' "$resolved_file")
-
-    # Values extracted — tmp file no longer needed. Drop it now so the
-    # `exec claude` at the end of launch_claude doesn't leak /tmp entries.
-    rm -f "$resolved_file"
-    trap - EXIT
 
     if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
       echo "" >&2
-      echo "  [ollama] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
-      save_last_session "ollama" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
+      echo "  [$tag] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
+      save_last_session "$tag" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
       launch_claude exec "$_pl_model" "$_pl_host" "$_pl_port" "$_pl_ctx" "${passthrough_args[@]}"
       return
     fi
     # Edit: fall through with defaults pre-filled
   fi
 
-  # --- New session: collect host[:port] (ollama default port 11434) ---
+  # --- New session: collect host[:port] ---
   local hp_default="${_pl_host:-localhost}${_pl_port:+:$_pl_port}"
-  [[ "$hp_default" == "localhost" ]] && hp_default="localhost:11434"
+  [[ "$hp_default" == "localhost" ]] && hp_default="localhost:${default_port}"
   local hp
   if [[ -n "${remote_host:-}" ]]; then
-    hp="${remote_host}:${_pl_port:-11434}"
+    hp="${remote_host}:${_pl_port:-${default_port}}"
   else
-    hp=$(ask "Ollama endpoint (host or host:port, default port 11434)" "$hp_default")
+    hp=$(ask "${pretty} endpoint (host or host:port, default port ${default_port})" "$hp_default")
   fi
   if [[ -z "$hp" ]]; then
     echo "Host is required." >&2
     exit 1
   fi
 
-  local o_host o_port
+  local cur_host cur_port
   if [[ "$hp" == *:* ]]; then
-    o_host="${hp%:*}"
-    o_port="${hp##*:}"
+    cur_host="${hp%:*}"
+    cur_port="${hp##*:}"
   else
-    o_host="$hp"
-    o_port="11434"
+    cur_host="$hp"
+    cur_port="$default_port"
   fi
-  local o_url="http://${o_host}:${o_port}"
+  local cur_url="http://${cur_host}:${cur_port}"
 
   # --- Best-effort model picker via /v1/models (single try, short timeout) ---
-  local o_model="${_pl_model:-}"
+  local cur_model="${_pl_model:-}"
   local api_models
-  api_models=$(curl -sf --max-time 2 "${o_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
+  api_models=$(curl -sf --max-time 2 "${cur_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
 
   if [[ -n "$api_models" ]]; then
     echo "" >&2
-    echo "Models on ${o_host}:${o_port}:" >&2
+    echo "Models on ${cur_host}:${cur_port}:" >&2
     echo "" >&2
     local -a model_list=()
     local count=0 mid
@@ -632,9 +660,9 @@ run_ollama() {
     printf "Select (1-%d or m): " "$count" >&2
     read -r selection
     if [[ "$selection" == "m" || "$selection" == "M" ]]; then
-      o_model=$(ask "Model id" "$o_model")
+      cur_model=$(ask "Model id" "$cur_model")
     elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
-      o_model="${model_list[$selection]}"
+      cur_model="${model_list[$selection]}"
     else
       echo "Invalid selection." >&2
       exit 1
@@ -642,22 +670,22 @@ run_ollama() {
   else
     echo "" >&2
     echo "  (/v1/models unreachable or empty — enter model id manually)" >&2
-    o_model=$(ask "Model id" "$o_model")
+    cur_model=$(ask "Model id" "$cur_model")
   fi
 
-  if [[ -z "$o_model" ]]; then
+  if [[ -z "$cur_model" ]]; then
     echo "Model id is required." >&2
     exit 1
   fi
 
   # --- Context window ---
-  local o_ctx
-  o_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
+  local cur_ctx
+  cur_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
 
   # --- Save profile (with validation) ---
-  local o_profile="$CONFIG_DIR/ollama-$(slug "${o_host}-${o_model}").json"
+  local cur_profile="$CONFIG_DIR/${tag}-$(slug "${cur_host}-${cur_model}").json"
   if [[ "${DRY_RUN:-false}" != "true" && "${CCLM_SKIP_VALIDATE:-0}" != "1" ]]; then
-    if ! _cclm_validate_endpoint "$o_url" "$o_model" "ollama"; then
+    if ! _cclm_validate_endpoint "$cur_url" "$cur_model" "$tag"; then
       if ! _cclm_confirm_unreachable_save; then
         echo "Profile not saved. You can re-run cclm to try again." >&2
         return 1
@@ -665,136 +693,24 @@ run_ollama() {
     fi
   fi
   jq -n \
-    --arg host "$o_host" \
-    --arg port "$o_port" \
-    --arg model "$o_model" \
-    --arg ctx "$o_ctx" \
-    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$o_profile"
+    --arg host "$cur_host" \
+    --arg port "$cur_port" \
+    --arg model "$cur_model" \
+    --arg ctx "$cur_ctx" \
+    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$cur_profile"
   echo "" >&2
-  echo "Profile saved: $o_profile" >&2
+  echo "Profile saved: $cur_profile" >&2
 
-  save_last_session "ollama" "$(basename "$o_profile")" "$o_host" "$o_model"
-  launch_claude exec "$o_model" "$o_host" "$o_port" "$o_ctx" "${passthrough_args[@]}"
+  save_last_session "$tag" "$(basename "$cur_profile")" "$cur_host" "$cur_model"
+  launch_claude exec "$cur_model" "$cur_host" "$cur_port" "$cur_ctx" "${passthrough_args[@]}"
 }
 
-# ============================================================================
-# vLLM Backend
-# ============================================================================
-# vLLM exposes an OpenAI-compatible API at http://<host>:8000/v1.
-# Shape mirrors run_ollama() but defaults to port 8000 and tags profiles
-# as vllm-<slug>.json so they're distinguishable in the picker.
-# Defined above the CCLM_LIB_ONLY guard so unit tests can assert on its
-# existence without triggering backend execution.
+# Ollama: OpenAI-compatible at http://<host>:11434/v1. Resolves `extends` chains.
+run_ollama() { _run_openai_compat ollama 11434 1; }
 
-run_vllm() {
-  # --- Preload fast-path (from profile picker) ---
-  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
-    local _pl_host _pl_port _pl_model _pl_ctx
-    _pl_host=$(jq -r '.host // ""' "$_PRELOADED_PROFILE")
-    _pl_port=$(jq -r '.port // "8000"' "$_PRELOADED_PROFILE")
-    _pl_model=$(jq -r '.model // ""' "$_PRELOADED_PROFILE")
-    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
-
-    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
-      echo "" >&2
-      echo "  [vllm] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
-      save_last_session "vllm" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
-      launch_claude exec "$_pl_model" "$_pl_host" "$_pl_port" "$_pl_ctx" "${passthrough_args[@]}"
-      return
-    fi
-    # Edit: fall through with defaults pre-filled
-  fi
-
-  # --- New session: collect host[:port] (vllm default port 8000) ---
-  local hp_default="${_pl_host:-localhost}${_pl_port:+:$_pl_port}"
-  [[ "$hp_default" == "localhost" ]] && hp_default="localhost:8000"
-  local hp
-  if [[ -n "${remote_host:-}" ]]; then
-    hp="${remote_host}:${_pl_port:-8000}"
-  else
-    hp=$(ask "vLLM endpoint (host or host:port, default port 8000)" "$hp_default")
-  fi
-  if [[ -z "$hp" ]]; then
-    echo "Host is required." >&2
-    exit 1
-  fi
-
-  local v_host v_port
-  if [[ "$hp" == *:* ]]; then
-    v_host="${hp%:*}"
-    v_port="${hp##*:}"
-  else
-    v_host="$hp"
-    v_port="8000"
-  fi
-  local v_url="http://${v_host}:${v_port}"
-
-  # --- Best-effort model picker via /v1/models (single try, short timeout) ---
-  local v_model="${_pl_model:-}"
-  local api_models
-  api_models=$(curl -sf --max-time 2 "${v_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
-
-  if [[ -n "$api_models" ]]; then
-    echo "" >&2
-    echo "Models on ${v_host}:${v_port}:" >&2
-    echo "" >&2
-    local -a model_list=()
-    local count=0 mid
-    while IFS= read -r mid; do
-      [[ -z "$mid" ]] && continue
-      count=$((count + 1))
-      model_list+=("$mid")
-      printf "  %d) %s\n" "$count" "$mid" >&2
-    done <<< "$api_models"
-    echo "  m) Enter model id manually" >&2
-    echo "" >&2
-    printf "Select (1-%d or m): " "$count" >&2
-    read -r selection
-    if [[ "$selection" == "m" || "$selection" == "M" ]]; then
-      v_model=$(ask "Model id" "$v_model")
-    elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
-      v_model="${model_list[$selection]}"
-    else
-      echo "Invalid selection." >&2
-      exit 1
-    fi
-  else
-    echo "" >&2
-    echo "  (/v1/models unreachable or empty — enter model id manually)" >&2
-    v_model=$(ask "Model id" "$v_model")
-  fi
-
-  if [[ -z "$v_model" ]]; then
-    echo "Model id is required." >&2
-    exit 1
-  fi
-
-  # --- Context window ---
-  local v_ctx
-  v_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
-
-  # --- Save profile (with validation) ---
-  local v_profile="$CONFIG_DIR/vllm-$(slug "${v_host}-${v_model}").json"
-  if [[ "${DRY_RUN:-false}" != "true" && "${CCLM_SKIP_VALIDATE:-0}" != "1" ]]; then
-    if ! _cclm_validate_endpoint "$v_url" "$v_model" "vllm"; then
-      if ! _cclm_confirm_unreachable_save; then
-        echo "Profile not saved. You can re-run cclm to try again." >&2
-        return 1
-      fi
-    fi
-  fi
-  jq -n \
-    --arg host "$v_host" \
-    --arg port "$v_port" \
-    --arg model "$v_model" \
-    --arg ctx "$v_ctx" \
-    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$v_profile"
-  echo "" >&2
-  echo "Profile saved: $v_profile" >&2
-
-  save_last_session "vllm" "$(basename "$v_profile")" "$v_host" "$v_model"
-  launch_claude exec "$v_model" "$v_host" "$v_port" "$v_ctx" "${passthrough_args[@]}"
-}
+# vLLM: OpenAI-compatible at http://<host>:8000/v1. No extends resolution
+# (preserves pre-refactor behavior; tests assert on the raw-read path).
+run_vllm() { _run_openai_compat vllm 8000 0; }
 
 # ============================================================================
 # `cclm log` subcommand
