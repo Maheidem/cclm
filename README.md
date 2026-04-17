@@ -1,16 +1,24 @@
-# cclm — Claude Code via Local Models
+# cclm — Claude Code via Local (or Remote) Models
 
-A zsh launcher that bridges [Claude Code](https://claude.com/code) with local LLMs served by [LM Studio](https://lmstudio.ai/) or [llama.cpp](https://github.com/ggerganov/llama.cpp) (`llama-server`). Pick a model, tune server/sampling parameters, and drop straight into Claude Code — all routed to your local GPU instead of the Anthropic API.
+A zsh launcher that bridges [Claude Code](https://claude.com/code) with an LLM of your choice — local GPU, LAN host, or remote Anthropic-compatible API — without changing how you use `claude`. Pick a model, save a profile, and drop straight into Claude Code.
+
+Four backends are supported:
+
+- **`lms`** — [LM Studio](https://lmstudio.ai/) (local or remote, via `lms` CLI + OpenAI-compatible API)
+- **`llama`** — [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (local or remote)
+- **`zai`** — [Z.ai GLM](https://z.ai) remote Anthropic-compatible endpoint, with per-tier (Opus / Sonnet / Haiku) model selection
+- **`remote`** — generic OpenAI-compatible remote (base URL + model name + ctx)
 
 Also includes a [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin that shows live `llama-server` metrics (tokens/s, context usage, generating/idle state) in the macOS menu bar.
 
 ## Prerequisites
 
-- [`claude`](https://claude.com/code) CLI installed and on `PATH`
-- At least one backend:
-  - [`lms`](https://lmstudio.ai/docs/cli) — LM Studio CLI, or
-  - `llama-server` — from llama.cpp (`brew install llama.cpp` on macOS)
+- [`claude`](https://claude.com/code) CLI on `PATH`
 - `jq` and `curl`
+- At least one backend tool:
+  - [`lms`](https://lmstudio.ai/docs/cli) for LM Studio
+  - `llama-server` from llama.cpp (`brew install llama.cpp`)
+  - Z.ai or another OpenAI-compatible endpoint for the remote backends (no local tool needed)
 
 ## Install
 
@@ -31,23 +39,27 @@ mkdir -p ~/.config/cclm
 ## Usage
 
 ```bash
-cclm                       # profile picker (or backend picker if no profiles)
+cclm                       # profile picker (backend picker if no profiles)
 cclm --lms                 # LM Studio backend directly
 cclm --llama               # llama.cpp backend directly
-cclm --llama -c            # passthrough flag to claude (resume last session)
-cclm --llama --resume      # passthrough --resume to claude
+cclm --zai                 # Z.ai GLM remote (tier selection)
+cclm --remote              # generic OpenAI-compatible remote
+cclm --host <ip_or_name>   # remote host for --lms / --llama
+cclm --llama --resume      # any unknown arg is passed through to claude
 ```
 
-### Profile Picker
+### Profile picker
 
-On first run with saved profiles, `cclm` shows a unified profile picker:
+On runs with saved profiles, `cclm` shows a unified picker across all backends:
 
 ```
 Saved profiles:
 
-  1) [llama] Qwen3.5-27B        remote:192.168.1.100  ctx:262144
-  2) [llama] gemma-4-E2B        local                 ctx:130000
-  3) [lms]   qwen3.5-27b        local                 ctx:200000
+   1) [llama] Qwen3.5-27B        remote:192.168.1.100  ctx:262144
+   2) [llama] gemma-4-E2B        local                 ctx:130000
+   3) [lms]   qwen3.5-27b        local                 ctx:200000
+   4) [zai]   glm-4.6            z.ai                  ctx:200000
+   5) [remote] llama-3.3-70b     10.0.0.5:8080         ctx:131072
 
   n) New session (full config)  q) Quit
 
@@ -59,38 +71,66 @@ Choice: 1
     d) Delete
     b) Back to list
 
-  Action [o]: ← press Enter = launch
+  Action [o]: ← Enter = launch
 ```
 
 Actions:
-- **o (open)**: Launch immediately with saved profile settings
-- **e (edit)**: Reconfigure params (current values as defaults), then launch
-- **d (delete)**: Remove the profile (with confirmation)
-- **n (new)**: Skip picker, use the classic backend/model selection flow
 
-### Classic Flow
+- **o (open)** — launch immediately with saved profile settings
+- **e (edit)** — re-prompt all parameters with current values as defaults, then launch
+- **d (delete)** — remove the profile (with confirmation)
+- **n (new)** — skip the picker, use the classic backend/model selection flow
+
+### Resume last session
+
+On the backend picker, if there is a recorded previous session, option `0) Resume last session` appears — selecting it re-dispatches to that backend against the previously-used remote host and model. State lives at `~/.config/cclm/.last_session`.
+
+### Classic flow
 
 When no profiles exist or you choose "New session":
 
-1. Pick backend (LM Studio or llama.cpp)
-2. Pick or enter a model
-3. Load or save a profile (stored per-model in `~/.config/cclm/`)
-4. For `llama.cpp`: tune context, KV cache type, flash attention, sampling, port, etc.
-5. Server starts (locally or via one-liner on a remote host), `cclm` polls `/health`, then launches `claude` with the right `ANTHROPIC_BASE_URL`
-
-When `claude` exits, a local `llama-server` started by `cclm` is automatically killed.
+1. Pick backend (lms / llama / zai / remote)
+2. Depending on backend, pick or enter a model (LM Studio/llama list available; Z.ai lets you pick Opus/Sonnet/Haiku tiers separately; remote asks for model name)
+3. Tune parameters (ctx, GPU layers, sampling, port, timeout…) — current profile values are used as defaults on subsequent runs
+4. For local `llama.cpp`: server starts, `cclm` polls `/health`, then launches `claude` — `llama-server` is killed on exit
+5. For remote hosts: `cclm` prints a copy-pasteable one-liner to run there, polls for readiness, then launches `claude`
 
 ## Profiles
 
-Profiles are plain JSON files saved per-model, prefixed by backend:
+Profiles are plain JSON files in `~/.config/cclm/`, prefixed by backend:
 
-- LM Studio: `~/.config/cclm/lms-<slug>.json`
-- llama.cpp: `~/.config/cclm/llama-<slug>.json`
-- Z.ai: `~/.config/cclm/zai-<name>.json`
+- **LM Studio:** `lms-<slug>.json`
+- **llama.cpp:** `llama-<slug>.json`
+- **Z.ai:** `zai-<name>.json`
+- **Remote:** `remote-<slug>.json`
 
-Each profile stores the model path, server parameters (context length, GPU layers, sampling settings, port, etc.), and for remote setups, the host address.
+Each profile captures model identifiers, server parameters, and (for remote setups) the host address. On first run cclm offers to save your answers; on subsequent runs the values become defaults.
 
-See `profiles/examples/` for starter templates. The script will offer to save your answers on first launch and reload them next time.
+Example templates live in `profiles/examples/`.
+
+## Backend notes
+
+### Z.ai (`--zai`)
+
+Z.ai speaks the Anthropic API, so cclm routes `claude` there via `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. You pick three models (one per tier: Opus / Sonnet / Haiku) which are then mapped to Claude Code's model tiers:
+
+| Claude tier | Env variable cclm sets | Typical Z.ai model |
+|---|---|---|
+| Opus  | `CCLM_TIER_OPUS`   | `glm-4.6` |
+| Sonnet | `CCLM_TIER_SONNET` | `glm-4.6` |
+| Haiku | `CCLM_TIER_HAIKU`  | `glm-4.5-air` |
+
+The configure step will offer "same as Opus/Sonnet" shortcuts so you don't have to type the model three times.
+
+`ZAI_API_KEY` is read from the environment. cclm will offer to save it to `~/.zshenv` on first run.
+
+### Generic remote (`--remote`)
+
+Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, model name per tier, `context_length`, and `api_timeout_ms`. Stored as `remote-<slug>.json`.
+
+### LM Studio / llama.cpp remote
+
+Use `--host <ip>` with `--lms` or `--llama` to run the backend on another machine. cclm prints a copy-pasteable one-liner to run there (binding `--host 0.0.0.0` for llama.cpp, `lms server start --port …` for LM Studio) and polls for readiness.
 
 ## SwiftBar plugin (macOS)
 
@@ -105,31 +145,23 @@ Install manually:
 cp plugins/swiftbar/llama-monitor.5s.sh "$HOME/Library/Application Support/SwiftBar/plugins/"
 ```
 
-The plugin requires `llama-server` to be started with `--metrics` (cclm does this automatically).
-
-## Remote servers
-
-If you want to run `llama-server` or `lms` on a different machine (a GPU box on your LAN), pick a **remote host** at the onboarding prompt. `cclm` will:
-
-1. Walk you through the same configuration questions
-2. Print a copy-pasteable one-liner to run on the remote machine
-3. Poll `http://<remote>:<port>/health` for up to 5 minutes
-4. Launch `claude` once the remote server is ready
-
-The remote one-liner uses `--host 0.0.0.0` so make sure your firewall allows the chosen port (default 8081 for llama.cpp).
+The plugin requires `llama-server` to be started with `--metrics` (cclm does this automatically). Server log lives at `~/.cache/cclm/llama-server.log`.
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
 | `CCLM_MODELS_DIR` | Override the GGUF scan directory (default: `~/.cache/lm-studio/models`) |
-| `ANTHROPIC_API_KEY` | `cclm` overrides this to `lmstudio` for local sessions; set it yourself only if your backend needs it |
-
-`cclm` exports `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to the real context reported by the server, so the Claude Code TUI shows the right window size.
+| `CCLM_API_TIMEOUT_MS` | Override API timeout passed to claude (default: profile value or 3000000 for remote) |
+| `CCLM_TIER_OPUS` / `_SONNET` / `_HAIKU` | Set by cclm for zai/remote backends; claude reads these via `ANTHROPIC_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` |
+| `ZAI_API_KEY` | Z.ai API token — read from env, optionally persisted to `~/.zshenv` |
+| `ANTHROPIC_API_KEY` | `cclm` overrides this to `lmstudio` for local sessions; don't set manually unless your backend needs it |
+| `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` | Set by cclm per backend; do not set manually |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Set by cclm to the profile's context length so claude auto-compacts at the correct boundary |
 
 ## Limitations
 
-- **macOS-first** — tested on macOS; Linux should work (the `stat` call is OS-aware) but is not yet tested
-- **LM Studio default model path** — `~/.cache/lm-studio/models`; override with `CCLM_MODELS_DIR` if you store GGUFs elsewhere
-- **SwiftBar plugin is macOS-only** — no Linux equivalent yet
+- **macOS-first** — tested on macOS; Linux should work (stat is OS-aware) but is not yet tested
+- **SwiftBar plugin is macOS-only**
 - **No Windows support** — zsh-only script
+- **Local LM Studio default model path** — `~/.cache/lm-studio/models`; override with `CCLM_MODELS_DIR`
