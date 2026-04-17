@@ -2,3 +2,9 @@
 *.swp
 /profiles/*.json
 !/profiles/examples/
+
+# Session-transient: claude-code memory, scratch, ralph-loop state, agent notes
+.claude/
+.remember/
+.scratchpad/
+agent_docs/

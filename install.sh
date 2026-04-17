@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # cclm installer — copies bin/cclm into $HOME/.local/bin and sets up config dir.
-# Optionally installs the SwiftBar monitoring plugin on macOS.
 
 set -euo pipefail
 
@@ -50,38 +49,6 @@ fi
 # ── Config dir ───────────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 echo "Config dir: $CONFIG_DIR"
-
-# ── Optional SwiftBar plugin (macOS only) ────────────────────────────────────
-if [[ "$(uname)" == "Darwin" ]]; then
-  SWIFTBAR_DIR="$HOME/Library/Application Support/SwiftBar/plugins"
-  SWIFTBAR_PLUGIN="$SWIFTBAR_DIR/llama-monitor.5s.sh"
-  SWIFTBAR_SRC="$REPO_DIR/plugins/swiftbar/llama-monitor.5s.sh"
-  if [[ -d "$SWIFTBAR_DIR" ]]; then
-    if [[ -f "$SWIFTBAR_PLUGIN" ]] && cmp -s "$SWIFTBAR_SRC" "$SWIFTBAR_PLUGIN"; then
-      echo "SwiftBar plugin already up to date — skipping."
-    else
-      _prompt="Install SwiftBar llama-server monitor plugin? (y/N): "
-      [[ -f "$SWIFTBAR_PLUGIN" ]] && _prompt="Update SwiftBar llama-server monitor plugin? (Y/n): "
-      read -r -p "$_prompt" reply
-      # Default: y when updating existing, n when installing fresh
-      if [[ -f "$SWIFTBAR_PLUGIN" ]]; then
-        _install=true
-        [[ "$reply" =~ ^[Nn]$ ]] && _install=false
-      else
-        _install=false
-        [[ "$reply" =~ ^[Yy]$ ]] && _install=true
-      fi
-      if $_install; then
-        cp "$SWIFTBAR_SRC" "$SWIFTBAR_PLUGIN"
-        chmod +x "$SWIFTBAR_PLUGIN"
-        echo "Installed SwiftBar plugin to: $SWIFTBAR_PLUGIN"
-        echo "Refresh SwiftBar (menu bar icon → Refresh all) to activate it."
-      fi
-    fi
-  else
-    echo "SwiftBar not detected at $SWIFTBAR_DIR — skipping plugin."
-  fi
-fi
 
 # ── PATH hint ────────────────────────────────────────────────────────────────
 case ":$PATH:" in

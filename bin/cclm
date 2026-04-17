@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# Opt-in stricter mode (set CCLM_STRICT=1) — warns on any new global variable
+# created inside a function. Helps catch missing `local` declarations.
+[[ "${CCLM_STRICT:-0}" == "1" ]] && setopt warn_create_global
+
 CONFIG_DIR="$HOME/.config/cclm"
 MODELS_DIR="${CCLM_MODELS_DIR:-$HOME/.cache/lm-studio/models}"
 STATE_FILE="$CONFIG_DIR/.last_session"
@@ -35,6 +39,145 @@ ask() {
   fi
   read -r reply
   echo "${reply:-$default}"
+}
+
+# Display a saved profile and ask if the user wants to reuse it.
+# Returns 0 if user accepts, 1 otherwise (missing file, edit mode, or "n").
+# Args: profile_path, field_specs... — each spec is "label|jq_filter[|group]"
+display_profile_and_ask() {
+  local profile="$1"; shift
+  [[ -f "$profile" ]] || return 1
+  if [[ "${EDIT_MODE:-false}" == "true" || "${_PRELOADED_ACTION:-}" == "edit" ]]; then
+    return 1
+  fi
+
+  echo "" >&2
+  echo "Saved profile:" >&2
+  local last_group="" spec label jq_filter group val reply
+  for spec in "$@"; do
+    IFS='|' read -r label jq_filter group <<< "$spec"
+    if [[ "$group" != "$last_group" ]]; then
+      [[ -n "$group" ]] && echo "  ${group}:" >&2
+      last_group="$group"
+    fi
+    val=$(jq -r "$jq_filter" "$profile" 2>/dev/null || echo "?")
+    [[ -z "$val" || "$val" == "null" ]] && val="-"
+    printf "    %-22s %s\n" "$label:" "$val" >&2
+  done
+  echo "" >&2
+  printf "Use saved profile? (Y/n): " >&2
+  read -r reply
+  [[ -z "$reply" || "$reply" =~ ^[Yy]$ ]]
+}
+
+# Poll until URL responds with jq filter returning success.
+# Usage: poll_until_ready <url> <jq_filter> <timeout_sec> <sleep_sec> <label>
+poll_until_ready() {
+  local url="$1" jq_filter="$2" timeout="$3" sleep_interval="$4" label="${5:-server}"
+  local waited=0
+  printf "  Waiting for %s..." "$label" >&2
+  while (( waited < timeout )); do
+    if curl -sf --max-time 2 "$url" 2>/dev/null | jq -e "$jq_filter" > /dev/null 2>&1; then
+      echo " ready." >&2
+      return 0
+    fi
+    printf "." >&2
+    sleep "$sleep_interval"
+    waited=$((waited + sleep_interval))
+  done
+  echo "" >&2
+  echo "Timed out waiting for ${label} (${timeout}s)." >&2
+  return 1
+}
+
+print_tier_routing() {
+  echo "" >&2
+  echo "Tier routing:" >&2
+  printf "  %-7s → %s\n" "Opus"   "$1" >&2
+  printf "  %-7s → %s  (startup)\n" "Sonnet" "$2" >&2
+  printf "  %-7s → %s  (subagents)\n" "Haiku" "$3" >&2
+}
+
+# ============================================================================
+# Profile Schemas
+# Each backend declares a PROFILE_SCHEMA array of "label|jq_filter[|group]"
+# specs. schema_display consumes any such array.
+# ============================================================================
+
+LMS_PROFILE_SCHEMA=(
+  "Context length|.context_length"
+  "GPU offload|.gpu"
+  "Parallel requests|.parallel"
+  "TTL (seconds)|.ttl // \"-\""
+  "API identifier|.identifier // \"-\""
+)
+
+LMS_PROFILE_SCHEMA_BRIEF=(
+  "Context length|.context_length"
+  "GPU offload|.gpu"
+  "Parallel|.parallel"
+)
+
+LLAMA_PROFILE_SCHEMA=(
+  "Context length|.ctx_len|Loading"
+  "GPU layers|.gpu_layers|Loading"
+  "Flash attention|.flash_attn|Loading"
+  "KV cache type K|.cache_type_k|Loading"
+  "KV cache type V|.cache_type_v|Loading"
+  "SWA full|.swa_full|Loading"
+  "Batch size|.batch_size|Loading"
+  "Ubatch size|.ubatch_size|Loading"
+  "Temperature|.temperature|Sampling"
+  "Top-P|.top_p|Sampling"
+  "Top-K|.top_k|Sampling"
+  "Min-P|.min_p|Sampling"
+  "Repeat penalty|.repeat_penalty|Sampling"
+  "Port|.port|Server"
+  "Parallel slots|.parallel_slots|Server"
+  "Slot save path|.slot_save_path // \"\"|Server"
+  "Cache RAM (MB)|.cache_ram // \"\"|Server"
+)
+
+LLAMA_PROFILE_SCHEMA_WITH_PATH=(
+  "Model path|.model_path"
+  "Context length|.ctx_len|Loading"
+  "GPU layers|.gpu_layers|Loading"
+  "Flash attention|.flash_attn|Loading"
+  "KV cache type K|.cache_type_k|Loading"
+  "KV cache type V|.cache_type_v|Loading"
+  "SWA full|.swa_full|Loading"
+  "Batch size|.batch_size|Loading"
+  "Ubatch size|.ubatch_size|Loading"
+  "Temperature|.temperature|Sampling"
+  "Top-P|.top_p|Sampling"
+  "Top-K|.top_k|Sampling"
+  "Min-P|.min_p|Sampling"
+  "Repeat penalty|.repeat_penalty|Sampling"
+  "Port|.port|Server"
+  "Parallel slots|.parallel_slots|Server"
+  "Slot save path|.slot_save_path // \"\"|Server"
+)
+
+ZAI_PROFILE_SCHEMA=(
+  "Base URL|.base_url"
+  "Opus|.opus_model"
+  "Sonnet|.sonnet_model"
+  "Haiku|.haiku_model"
+  "Context|.context_length"
+  "Timeout|.api_timeout_ms"
+)
+
+REMOTE_PROFILE_SCHEMA=(
+  "Host|.host"
+  "Port|.port"
+  "Model|.model"
+  "Context length|.context_length"
+)
+
+# schema_display: thin wrapper that pins the canonical call shape across
+# backends. Takes a profile path and a schema array (spread with "${arr[@]}").
+schema_display() {
+  display_profile_and_ask "$@"
 }
 
 # Human-readable file size
@@ -163,15 +306,21 @@ launch_claude() {
   fi
 }
 
+# When sourced for tests (CCLM_LIB_ONLY=1), return here — helpers are defined,
+# main execution (migration, arg parsing, backend dispatch) is skipped.
+[[ "${CCLM_LIB_ONLY:-0}" == "1" ]] && return 0
+
 # ============================================================================
 # Profile Migration
 # ============================================================================
 
 for f in "$CONFIG_DIR"/*.json(N); do
   _base="${f:t}"
-  if [[ "$_base" != lms-* && "$_base" != llama-* && "$_base" != zai-* && "$_base" != remote-* ]]; then
-    mv "$f" "$CONFIG_DIR/lms-${_base}"
-  fi
+  [[ "$_base" == .* ]] && continue
+  [[ "$_base" == lms-* || "$_base" == llama-* || "$_base" == zai-* || "$_base" == remote-* ]] && continue
+  [[ "$_base" != *-* ]] && continue
+  mv "$f" "$CONFIG_DIR/lms-${_base}"
+  echo "  [migrate] ${_base} -> lms-${_base}" >&2
 done
 
 # Add remote_host field to profiles that lack it (backward compat)
@@ -337,7 +486,7 @@ pick_profile() {
         continue
         ;;
       b|B) i=1; continue ;;
-      *) echo "  Invalid action." >&2; i=1; continue ;;
+      *) echo "  Invalid action." >&2; continue ;;
     esac
   done
 }
@@ -439,20 +588,8 @@ run_lms() {
           echo "" >&2
           echo "  ────────────────────────────────────────────────────────────────" >&2
           echo "" >&2
-          printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$LMS_HOST" "$LMS_PORT" >&2
-          local waited=0 timeout=300
-          while (( waited < timeout )); do
-            if curl -sf --max-time 2 "${LMS_URL}/v1/models" 2>/dev/null | jq -e '.data | length > 0' > /dev/null 2>&1; then
-              echo " ready." >&2
-              break
-            fi
-            printf "." >&2
-            sleep 5
-            waited=$((waited + 5))
-          done
-          if (( waited >= timeout )); then
+          if ! poll_until_ready "${LMS_URL}/v1/models" '.data | length > 0' 300 5 "${LMS_HOST}:${LMS_PORT}"; then
             echo "" >&2
-            echo "Timed out (${timeout}s)." >&2
             exit 1
           fi
         fi
@@ -480,6 +617,10 @@ run_lms() {
         lms load "${load_args[@]}"
         local api_id
         api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end' 2>/dev/null || true)
+        [[ "$api_id" == "null" || -z "$api_id" ]] && {
+          echo "No model loaded in LM Studio. Run: lms load <model>" >&2
+          exit 1
+        }
         save_last_session "lms" "$(basename "$_PRELOADED_PROFILE")" "$LMS_HOST" "$api_id"
         launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$_pl_ctx" "${passthrough_args[@]}"
       fi
@@ -516,22 +657,8 @@ run_lms() {
       lms_profile="$CONFIG_DIR/lms-$(slug "$lms_model_key").json"
 
       local use_lms_saved=false
-      if [[ -f "$lms_profile" ]]; then
-        if [[ "${EDIT_MODE:-false}" == "true" ]]; then
-          echo "" >&2
-          echo "Edit mode: current values shown as defaults below." >&2
-          use_lms_saved=false
-        else
-          echo "" >&2
-          echo "Saved profile for $lms_model_key:" >&2
-          printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$lms_profile")" >&2
-          printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$lms_profile")" >&2
-          printf "  %-20s %s\n" "Parallel:" "$(jq -r '.parallel' "$lms_profile")" >&2
-          echo "" >&2
-          printf "Use saved profile? (Y/n): " >&2
-          read -r use_reply
-          [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_lms_saved=true
-        fi
+      if schema_display "$lms_profile" "${LMS_PROFILE_SCHEMA_BRIEF[@]}"; then
+        use_lms_saved=true
       fi
 
       local d_lctx="65536" d_lgpu="max" d_lpar="1"
@@ -572,20 +699,8 @@ run_lms() {
       echo "  ────────────────────────────────────────────────────────────────" >&2
       echo "" >&2
 
-      printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$LMS_HOST" "$LMS_PORT" >&2
-      local waited=0 timeout=300
-      while (( waited < timeout )); do
-        if curl -sf --max-time 2 "${LMS_URL}/v1/models" 2>/dev/null | jq -e '.data | length > 0' > /dev/null 2>&1; then
-          echo " ready." >&2
-          break
-        fi
-        printf "." >&2
-        sleep 5
-        waited=$((waited + 5))
-      done
-      if (( waited >= timeout )); then
+      if ! poll_until_ready "${LMS_URL}/v1/models" '.data | length > 0' 300 5 "${LMS_HOST}:${LMS_PORT}"; then
         echo "" >&2
-        echo "Timed out (${timeout}s)." >&2
         exit 1
       fi
 
@@ -706,27 +821,8 @@ run_lms() {
 
   # Load or edit profile
   local use_saved=false
-  if [[ -f "$profile" ]]; then
-    if [[ "${EDIT_MODE:-false}" == "true" ]]; then
-      echo "" >&2
-      echo "Edit mode: current values shown as defaults below." >&2
-      use_saved=false
-    else
-      echo "" >&2
-      echo "Saved profile for $chosen:" >&2
-      echo "" >&2
-      printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$profile")" >&2
-      printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$profile")" >&2
-      printf "  %-20s %s\n" "Parallel requests:" "$(jq -r '.parallel' "$profile")" >&2
-      printf "  %-20s %s\n" "TTL (seconds):" "$(jq -r '.ttl // "-"' "$profile")" >&2
-      printf "  %-20s %s\n" "API identifier:" "$(jq -r '.identifier // "-"' "$profile")" >&2
-      echo "" >&2
-      printf "Use saved profile? (Y/n): " >&2
-      read -r use_reply
-      if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
-        use_saved=true
-      fi
-    fi
+  if schema_display "$profile" "${LMS_PROFILE_SCHEMA[@]}"; then
+    use_saved=true
   fi
 
   local ctx_size gpu parallel ttl identifier
@@ -801,6 +897,10 @@ run_lms() {
   # Resolve API identifier
   local api_id
   api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end' 2>/dev/null || true)
+  [[ "$api_id" == "null" || -z "$api_id" ]] && {
+    echo "No model loaded in LM Studio. Run: lms load <model>" >&2
+    exit 1
+  }
 
   save_last_session "lms" "lms-$(slug "$api_id").json" "$LMS_HOST" "$api_id"
   launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
@@ -855,37 +955,8 @@ run_llama() {
     fi
 
     if [[ -f "$profile" ]] && ! $use_saved; then
-      if [[ "${_PRELOADED_ACTION:-}" == "edit" ]]; then
-        echo "" >&2
-        echo "Edit mode: current values shown as defaults below." >&2
-      else
-        echo "" >&2
-        echo "Saved profile for $model_id:" >&2
-        echo "" >&2
-        echo "  Loading:" >&2
-        printf "    %-20s %s\n" "Model path:" "$(jq -r '.model_path' "$profile")" >&2
-        printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
-        printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
-        printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
-        printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
-        printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
-        printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
-        printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
-        printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
-        echo "  Sampling:" >&2
-        printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
-        printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
-        printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
-        printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
-        printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
-        echo "  Server:" >&2
-        printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
-        printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
-        printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
-        echo "" >&2
-        printf "Use saved profile? (Y/n): " >&2
-        read -r use_reply
-        [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_saved=true
+      if schema_display "$profile" "${LLAMA_PROFILE_SCHEMA_WITH_PATH[@]}"; then
+        use_saved=true
       fi
     fi
 
@@ -1011,21 +1082,8 @@ run_llama() {
       echo "" >&2
       echo "Remote server is already running. Connecting..." >&2
     else
-      echo "" >&2
-      printf "  Waiting for %s:%s (Ctrl+C to cancel)..." "$llama_host" "$port" >&2
-      local waited=0 timeout=300
-      while (( waited < timeout )); do
-        if curl -sf --max-time 2 "$remote_health" 2>/dev/null | jq -e '.status == "ok"' > /dev/null 2>&1; then
-          echo " ready." >&2
-          break
-        fi
-        printf "." >&2
-        sleep 5
-        waited=$((waited + 5))
-      done
-      if (( waited >= timeout )); then
+      if ! poll_until_ready "$remote_health" '.status == "ok"' 300 5 "${llama_host}:${port}"; then
         echo "" >&2
-        echo "Timed out (${timeout}s)." >&2
         exit 1
       fi
     fi
@@ -1117,33 +1175,7 @@ run_llama() {
 
   # --- Profile load or configure ---
   if [[ -f "$profile" ]] && ! $use_saved; then
-    echo "" >&2
-    echo "Saved profile for $model_id:" >&2
-    echo "" >&2
-    echo "  Loading:" >&2
-    printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
-    printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
-    printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
-    printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
-    printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
-    printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
-    printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
-    printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
-    echo "  Sampling:" >&2
-    printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
-    printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
-    printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
-    printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
-    printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
-    echo "  Server:" >&2
-    printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
-    printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
-    printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
-    printf "    %-20s %s\n" "Cache RAM (MB):" "$(jq -r '.cache_ram // ""' "$profile")" >&2
-    echo "" >&2
-    printf "Use saved profile? (Y/n): " >&2
-    read -r use_reply
-    if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
+    if schema_display "$profile" "${LLAMA_PROFILE_SCHEMA[@]}"; then
       use_saved=true
     fi
   fi
@@ -1462,11 +1494,7 @@ run_zai() {
       export CCLM_TIER_HAIKU="$haiku_model"
       export CCLM_API_TIMEOUT_MS="$timeout_ms"
 
-      echo "" >&2
-      echo "Tier routing:" >&2
-      printf "  %-7s → %s\n" "Opus"   "$opus_model"   >&2
-      printf "  %-7s → %s  (startup)\n" "Sonnet" "$sonnet_model" >&2
-      printf "  %-7s → %s  (subagents)\n" "Haiku" "$haiku_model" >&2
+      print_tier_routing "$opus_model" "$sonnet_model" "$haiku_model"
 
       launch_claude exec "$sonnet_model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
       return
@@ -1537,23 +1565,10 @@ run_zai() {
 
   # --- 3b. Use saved profile as-is? (skip all prompts if yes) ---
   local use_saved=false
-  # When preloaded with "edit" action, force use_saved=false to show config prompts
-  if [[ "${_PRELOADED_ACTION:-}" == "edit" ]]; then
-    use_saved=false
-  elif [[ -f "$profile" && -n "$d_base_url" && -n "$d_opus" && -n "$d_sonnet" && -n "$d_haiku" ]]; then
-    echo "" >&2
-    echo "Saved profile:" >&2
-    printf "  %-13s %s\n" "Base URL:" "$d_base_url"     >&2
-    printf "  %-13s %s\n" "Opus:"     "$d_opus"         >&2
-    printf "  %-13s %s\n" "Sonnet:"   "$d_sonnet"       >&2
-    printf "  %-13s %s\n" "Haiku:"    "$d_haiku"        >&2
-    printf "  %-13s %s\n" "Context:"  "$d_ctx"          >&2
-    printf "  %-13s %s\n" "Timeout:"  "$d_timeout_ms"   >&2
-    echo "" >&2
-    printf "Use saved profile? (Y/n): " >&2
-    local _use_reply
-    read -r _use_reply
-    [[ -z "$_use_reply" || "$_use_reply" =~ ^[Yy]$ ]] && use_saved=true
+  if [[ -f "$profile" && -n "$d_base_url" && -n "$d_opus" && -n "$d_sonnet" && -n "$d_haiku" ]]; then
+    if schema_display "$profile" "${ZAI_PROFILE_SCHEMA[@]}"; then
+      use_saved=true
+    fi
   fi
 
   # Output variables populated by either the saved-profile path or the prompts below.
@@ -1568,23 +1583,33 @@ run_zai() {
     timeout_ms="$d_timeout_ms"
   else
     # --- 4. Base URL ---
-    echo "" >&2
-    echo "Base URL:" >&2
-    echo "  1) https://api.z.ai/api/anthropic        (official Claude Code endpoint — recommended)" >&2
-    echo "  2) https://api.z.ai/api/coding/paas/v4   (Coding Plan subscription, OpenAI protocol)" >&2
-    echo "  3) Custom" >&2
-    local url_default_hint="1"
-    [[ -n "$d_base_url" ]] && url_default_hint="current: $d_base_url"
-    printf "Choice [%s]: " "$url_default_hint" >&2
-    local uchoice
-    read -r uchoice
-    case "${uchoice:-}" in
-      1) base_url="https://api.z.ai/api/anthropic" ;;
-      2) base_url="https://api.z.ai/api/coding/paas/v4" ;;
-      3) base_url="$(ask 'Custom base URL' "${d_base_url:-https://api.z.ai/api/anthropic}")" ;;
-      "") base_url="${d_base_url:-https://api.z.ai/api/anthropic}" ;;
-      *)  echo "Invalid selection." >&2; exit 1 ;;
-    esac
+    if [[ -n "${remote_host:-}" ]]; then
+      # --host flag provided: use it directly as base URL
+      if [[ "$remote_host" == http://* || "$remote_host" == https://* ]]; then
+        base_url="$remote_host"
+      else
+        base_url="https://${remote_host}"
+      fi
+      echo "  Using custom endpoint: $base_url" >&2
+    else
+      echo "" >&2
+      echo "Base URL:" >&2
+      echo "  1) https://api.z.ai/api/anthropic        (official Claude Code endpoint — recommended)" >&2
+      echo "  2) https://api.z.ai/api/coding/paas/v4   (Coding Plan subscription, OpenAI protocol)" >&2
+      echo "  3) Custom" >&2
+      local url_default_hint="1"
+      [[ -n "$d_base_url" ]] && url_default_hint="current: $d_base_url"
+      printf "Choice [%s]: " "$url_default_hint" >&2
+      local uchoice
+      read -r uchoice
+      case "${uchoice:-}" in
+        1) base_url="https://api.z.ai/api/anthropic" ;;
+        2) base_url="https://api.z.ai/api/coding/paas/v4" ;;
+        3) base_url="$(ask 'Custom base URL' "${d_base_url:-https://api.z.ai/api/anthropic}")" ;;
+        "") base_url="${d_base_url:-https://api.z.ai/api/anthropic}" ;;
+        *)  echo "Invalid selection." >&2; exit 1 ;;
+      esac
+    fi
 
     # --- 5. Per-tier model selection ---
     # Fetch live model list from Z.ai's OpenAI-compat /models endpoint
@@ -1713,11 +1738,7 @@ run_zai() {
   export CCLM_TIER_HAIKU="$haiku_model"
   export CCLM_API_TIMEOUT_MS="$timeout_ms"
 
-  echo "" >&2
-  echo "Tier routing:" >&2
-  printf "  %-7s → %s\n" "Opus"   "$opus_model"   >&2
-  printf "  %-7s → %s  (startup)\n" "Sonnet" "$sonnet_model" >&2
-  printf "  %-7s → %s  (subagents)\n" "Haiku" "$haiku_model" >&2
+  print_tier_routing "$opus_model" "$sonnet_model" "$haiku_model"
 
   launch_claude exec "$sonnet_model" "$base_url" "" "$ctx" "${passthrough_args[@]}"
 }
@@ -1751,7 +1772,11 @@ run_remote() {
   # --- New session: collect host[:port] ---
   local hp_default="${_pl_host:-}${_pl_port:+:$_pl_port}"
   local hp
-  hp=$(ask "Remote endpoint (host or host:port, default port 1234)" "$hp_default")
+  if [[ -n "${remote_host:-}" ]]; then
+    hp="${remote_host}:${_pl_port:-1234}"
+  else
+    hp=$(ask "Remote endpoint (host or host:port, default port 1234)" "$hp_default")
+  fi
   if [[ -z "$hp" ]]; then
     echo "Host is required." >&2
     exit 1

@@ -1,0 +1,6 @@
+{
+  "host": "10.0.0.5",
+  "port": "8080",
+  "model": "llama-3.3-70b",
+  "context_length": "131072"
+}

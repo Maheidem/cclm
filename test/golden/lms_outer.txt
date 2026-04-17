@@ -1,0 +1,9 @@
+
+Saved profile:
+    Context length:        65536
+    GPU offload:           max
+    Parallel requests:     1
+    TTL (seconds):         3600
+    API identifier:        qwen3-test@q8
+
+Use saved profile? (Y/n): 

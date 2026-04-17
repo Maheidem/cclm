@@ -9,8 +9,6 @@ Four backends are supported:
 - **`zai`** — [Z.ai GLM](https://z.ai) remote Anthropic-compatible endpoint, with per-tier (Opus / Sonnet / Haiku) model selection
 - **`remote`** — generic OpenAI-compatible remote (base URL + model name + ctx)
 
-Also includes a [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin that shows live `llama-server` metrics (tokens/s, context usage, generating/idle state) in the macOS menu bar.
-
 ## Prerequisites
 
 - [`claude`](https://claude.com/code) CLI on `PATH`
@@ -27,7 +25,7 @@ git clone <this-repo> cclm && cd cclm
 bash install.sh
 ```
 
-This copies `bin/cclm` to `~/.local/bin/cclm` and creates `~/.config/cclm/`. On macOS it also offers to install the SwiftBar plugin.
+This copies `bin/cclm` to `~/.local/bin/cclm` and creates `~/.config/cclm/`.
 
 Manual install:
 
@@ -132,21 +130,6 @@ Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, mo
 
 Use `--host <ip>` with `--lms` or `--llama` to run the backend on another machine. cclm prints a copy-pasteable one-liner to run there (binding `--host 0.0.0.0` for llama.cpp, `lms server start --port …` for LM Studio) and polls for readiness.
 
-## SwiftBar plugin (macOS)
-
-`plugins/swiftbar/llama-monitor.5s.sh` polls `llama-server` on `localhost:8081` every 5 seconds and shows:
-
-- **Menu bar**: `◯ idle` (green), `⚙ prefill…` (orange), or `▶ X.X tok/s` (blue, generating)
-- **Dropdown**: context %, KV cache %, slot info, refresh action, open server log
-
-Install manually:
-
-```bash
-cp plugins/swiftbar/llama-monitor.5s.sh "$HOME/Library/Application Support/SwiftBar/plugins/"
-```
-
-The plugin requires `llama-server` to be started with `--metrics` (cclm does this automatically). Server log lives at `~/.cache/cclm/llama-server.log`.
-
 ## Environment variables
 
 | Variable | Purpose |
@@ -162,6 +145,5 @@ The plugin requires `llama-server` to be started with `--metrics` (cclm does thi
 ## Limitations
 
 - **macOS-first** — tested on macOS; Linux should work (stat is OS-aware) but is not yet tested
-- **SwiftBar plugin is macOS-only**
 - **No Windows support** — zsh-only script
 - **Local LM Studio default model path** — `~/.cache/lm-studio/models`; override with `CCLM_MODELS_DIR`

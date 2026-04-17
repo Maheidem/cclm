@@ -1,0 +1,5 @@
+start_test "slug"
+assert_eq "qwen3-27b" "$(slug 'Qwen3-27B' | tr 'A-Z' 'a-z')" "lowercase basic"
+assert_eq "qwen3_27b" "$(slug 'qwen3/27b')" "slash to underscore"
+assert_eq "gpt-oss-120b" "$(slug 'gpt oss 120b')" "space to dash"
+assert_eq "abc123" "$(slug 'abc!@#123')" "strips special chars"

@@ -1,0 +1,9 @@
+{
+  "model": "qwen3-test",
+  "context_length": 65536,
+  "gpu": "max",
+  "parallel": 1,
+  "ttl": 3600,
+  "identifier": "qwen3-test@q8",
+  "remote_host": null
+}

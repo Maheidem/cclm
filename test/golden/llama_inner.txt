@@ -1,0 +1,24 @@
+
+Saved profile:
+    Model path:            /models/test-27b.gguf
+  Loading:
+    Context length:        131072
+    GPU layers:            99
+    Flash attention:       true
+    KV cache type K:       q8_0
+    KV cache type V:       q8_0
+    SWA full:              false
+    Batch size:            2048
+    Ubatch size:           512
+  Sampling:
+    Temperature:           0.7
+    Top-P:                 0.9
+    Top-K:                 40
+    Min-P:                 0.05
+    Repeat penalty:        1.1
+  Server:
+    Port:                  8081
+    Parallel slots:        1
+    Slot save path:        -
+
+Use saved profile? (Y/n): 

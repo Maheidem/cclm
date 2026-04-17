@@ -1,0 +1,8 @@
+{
+  "base_url": "https://api.z.ai/api/anthropic",
+  "opus_model": "glm-4.6",
+  "sonnet_model": "glm-4.6",
+  "haiku_model": "glm-4.5-air",
+  "context_length": 200000,
+  "api_timeout_ms": 3000000
+}

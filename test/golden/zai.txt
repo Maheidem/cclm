@@ -1,0 +1,10 @@
+
+Saved profile:
+    Base URL:              https://api.z.ai/api/anthropic
+    Opus:                  glm-4.6
+    Sonnet:                glm-4.6
+    Haiku:                 glm-4.5-air
+    Context:               200000
+    Timeout:               3000000
+
+Use saved profile? (Y/n): 

@@ -1,0 +1,21 @@
+{
+  "model_path": "/models/test-27b.gguf",
+  "ctx_len": 131072,
+  "gpu_layers": 99,
+  "flash_attn": true,
+  "cache_type_k": "q8_0",
+  "cache_type_v": "q8_0",
+  "swa_full": false,
+  "batch_size": 2048,
+  "ubatch_size": 512,
+  "temperature": 0.7,
+  "top_p": 0.9,
+  "top_k": 40,
+  "min_p": 0.05,
+  "repeat_penalty": 1.1,
+  "port": 8081,
+  "parallel_slots": 1,
+  "slot_save_path": "",
+  "cache_ram": "",
+  "remote_host": null
+}

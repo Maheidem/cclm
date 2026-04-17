@@ -1,0 +1,7 @@
+
+Saved profile:
+    Context length:        65536
+    GPU offload:           max
+    Parallel:              1
+
+Use saved profile? (Y/n): 
