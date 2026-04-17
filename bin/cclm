@@ -434,7 +434,7 @@ run_lms() {
           lms unload "$loaded_id" 2>/dev/null || true
         fi
         local -a load_args=("-c" "$_pl_ctx" "--gpu" "$_pl_gpu" "--parallel" "$_pl_parallel" "-y")
-        [[ -n "$_pl_ttl" ]] && load_args+=("--ttl" "${_pl_ttl}s")
+        [[ -n "$_pl_ttl" ]] && load_args+=("--ttl" "$_pl_ttl")
         [[ -n "$_pl_id" ]] && load_args+=("--identifier" "$_pl_id")
         load_args+=("$_pl_model")
         echo "Loading: $_pl_model" >&2
