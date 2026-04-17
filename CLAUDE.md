@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-cclm is a single-file zsh script (`bin/cclm`, ~1820 lines) that bridges [Claude Code](https://claude.com/code) with local or remote LLM backends without changing how you use `claude`. It provides four backends: LM Studio, llama.cpp (llama-server), Z.ai GLM, and a generic OpenAI-compatible remote. Profiles are saved as plain JSON in `~/.config/cclm/` for reuse via a unified profile picker.
+cclm is a single-file zsh script (`bin/cclm`, ~1980 lines) that bridges [Claude Code](https://claude.com/code) with local or remote LLM backends without changing how you use `claude`. It provides five backends: LM Studio, llama.cpp (llama-server), Z.ai GLM, a generic OpenAI-compatible remote, and Ollama. Profiles are saved as plain JSON in `~/.config/cclm/` for reuse via a unified profile picker.
 
 ## Commands
 
@@ -22,6 +22,7 @@ FORCE=1 bash install.sh          # skip overwrite prompt
 ./bin/cclm --llama              # llama.cpp direct  
 ./bin/cclm --zai                # Z.ai GLM remote
 ./bin/cclm --remote             # generic OpenAI-compatible remote
+./bin/cclm --ollama             # Ollama (OpenAI-compatible, default port 11434)
 ./bin/cclm --host 192.168.1.50  # remote host for local backends
 ```
 
@@ -33,12 +34,12 @@ No build, lint, or test steps exist — this is a zsh script with no test framew
 All logic lives in one zsh script organized into these sections:
 
 1. **Setup & helpers** — portability shims (macOS/Linux stat), `slug()`, `ask()`, `human_size()`, plus three shared helpers used across backends: `display_profile_and_ask()` (prints a saved profile and returns 0/1 on accept/reject), `poll_until_ready()` (curl+jq polling loop), `print_tier_routing()` (Opus/Sonnet/Haiku routing display). `schema_display` is a thin wrapper over `display_profile_and_ask` for use with `*_PROFILE_SCHEMA` arrays.
-1a. **Profile schemas** — top-level `LMS_PROFILE_SCHEMA`, `LMS_PROFILE_SCHEMA_BRIEF`, `LLAMA_PROFILE_SCHEMA`, `LLAMA_PROFILE_SCHEMA_WITH_PATH`, `ZAI_PROFILE_SCHEMA`, `REMOTE_PROFILE_SCHEMA` arrays of `"label|jq_filter[|group]"` specs. Each backend's display site calls `schema_display "$profile" "${SCHEMA[@]}"` rather than inlining specs. Golden-file tests in `test/golden/` pin the display output.
+1a. **Profile schemas** — top-level `LMS_PROFILE_SCHEMA`, `LMS_PROFILE_SCHEMA_BRIEF`, `LLAMA_PROFILE_SCHEMA`, `LLAMA_PROFILE_SCHEMA_WITH_PATH`, `ZAI_PROFILE_SCHEMA`, `REMOTE_PROFILE_SCHEMA`, `OLLAMA_PROFILE_SCHEMA` arrays of `"label|jq_filter[|group]"` specs. Each backend's display site calls `schema_display "$profile" "${SCHEMA[@]}"` rather than inlining specs. Golden-file tests in `test/golden/` pin the display output.
 2. **Session state** — `load_last_session()` / `save_last_session()` read/write JSON to `~/.config/cclm/.last_session`
 3. **Profile migration** — on startup, auto-renames old-format profiles (bare `<slug>.json` → `lms-<slug>.json`) and backfills the `remote_host` field in llama profiles via jq (backward compat)
 4. **Argument parsing** — handles `--lms`, `--llama`, `--zai`, `--remote`, `--host=`, and passthrough args
 5. **Profile picker** (`pick_profile()`) — unified list across all backends with open/edit/delete actions; sets `_PRELOADED_PROFILE` / `_PRELOADED_ACTION` globals
-6. **Backend functions** — four independent functions (`run_lms`, `run_llama`, `run_zai`, `run_remote`) that each follow the same pattern:
+6. **Backend functions** — five independent functions (`run_lms`, `run_llama`, `run_zai`, `run_remote`, `run_ollama`) that each follow the same pattern:
    - Preload fast-path (from profile picker) → skip prompts, read saved JSON, set env vars, call `launch_claude`
    - Edit mode (from profile picker) → fall through to full flow with defaults pre-filled
    - Interactive config → prompt user, save new profile, call `launch_claude`
@@ -56,6 +57,7 @@ Plain JSON in `~/.config/cclm/` prefixed by backend:
 - llama.cpp: `llama-<slug>.json` — fields: `model`, `ctx_len`, `gpu_layers`, `flash_attn`, `cache_type_*`, `swa_full`, `batch_size`, `temperature`, `port`, `parallel_slots`, etc.
 - Z.ai: `zai-<name>.json` — fields: `base_url`, `opus_model`, `sonnet_model`, `haiku_model`, `context_length`, `api_timeout_ms`
 - Remote: `remote-<slug>.json` — fields: `host`, `port`, `model`, `context_length`
+- Ollama: `ollama-<slug>.json` — fields: `host`, `port` (default `"11434"`), `model`, `context_length`
 
 Example templates in `profiles/examples/`.
 
