@@ -1,0 +1,6 @@
+{
+  "host": "localhost",
+  "port": "8000",
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "context_length": "131072"
+}

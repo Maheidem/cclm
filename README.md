@@ -2,13 +2,14 @@
 
 A zsh launcher that bridges [Claude Code](https://claude.com/code) with an LLM of your choice — local GPU, LAN host, or remote Anthropic-compatible API — without changing how you use `claude`. Pick a model, save a profile, and drop straight into Claude Code.
 
-Five backends are supported:
+Six backends are supported:
 
 - **`lms`** — [LM Studio](https://lmstudio.ai/) (local or remote, via `lms` CLI + OpenAI-compatible API)
 - **`llama`** — [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (local or remote)
 - **`zai`** — [Z.ai GLM](https://z.ai) remote Anthropic-compatible endpoint, with per-tier (Opus / Sonnet / Haiku) model selection
 - **`remote`** — generic OpenAI-compatible remote (base URL + model name + ctx)
 - **`ollama`** — [Ollama](https://ollama.com/) OpenAI-compatible endpoint (defaults to `localhost:11434`)
+- **`vllm`** — [vLLM](https://github.com/vllm-project/vllm) OpenAI-compatible endpoint (defaults to `localhost:8000`)
 
 ## Prerequisites
 
@@ -76,10 +77,29 @@ cclm --llama               # llama.cpp backend directly
 cclm --zai                 # Z.ai GLM remote (tier selection)
 cclm --remote              # generic OpenAI-compatible remote
 cclm --ollama              # Ollama (OpenAI-compatible; default port 11434)
+cclm --vllm                # vLLM (OpenAI-compatible; default port 8000)
 cclm --host <ip_or_name>   # remote host for --lms / --llama
 cclm --llama --resume      # any unknown arg is passed through to claude
 cclm status                # health report (last session, profiles, backend reachability) — does not launch claude
+cclm edit <slug> [field]   # targeted edit of one profile field; no backend re-prompt
 ```
+
+### Edit a profile field (`cclm edit`)
+
+Change a single profile field without re-running the full backend flow. Omit the
+field to get an interactive numbered picker; pass a field to edit it directly.
+Matching is exact on the jq-key first, else case-insensitive substring on
+key or label — ambiguous matches are rejected with the candidates listed.
+
+```bash
+cclm edit llama-qwen3                  # pick a field interactively
+cclm edit llama-qwen3 ctx_len          # direct edit by jq-key
+cclm edit remote-anthropic Host        # label-substring match also works
+```
+
+JSON types are preserved across edits (a numeric `context_length` stays a
+number; a `null` field stays null when the new value is left empty), so
+profile files remain byte-compatible with the existing parser.
 
 ### Status (`cclm status`)
 
@@ -185,6 +205,7 @@ Profiles are plain JSON files in `~/.config/cclm/`, prefixed by backend:
 - **Z.ai:** `zai-<name>.json`
 - **Remote:** `remote-<slug>.json`
 - **Ollama:** `ollama-<slug>.json`
+- **vLLM:** `vllm-<slug>.json`
 
 Each profile captures model identifiers, server parameters, and (for remote setups) the host address. On first run cclm offers to save your answers; on subsequent runs the values become defaults.
 
@@ -213,6 +234,10 @@ Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, mo
 ### Ollama (`--ollama`)
 
 Ollama exposes an OpenAI-compatible API at `http://<host>:11434/v1`. cclm prompts for `host[:port]` (default `localhost:11434`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `ollama-<slug>.json`. Start Ollama with `ollama serve` before launching.
+
+### vLLM (`--vllm`)
+
+vLLM exposes an OpenAI-compatible API at `http://<host>:8000/v1`. cclm prompts for `host[:port]` (default `localhost:8000`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `vllm-<slug>.json`. Start vLLM with `vllm serve <model>` (or your usual `python -m vllm.entrypoints.openai.api_server …` invocation) before launching.
 
 ### LM Studio / llama.cpp remote
 

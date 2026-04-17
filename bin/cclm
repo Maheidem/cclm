@@ -181,6 +181,13 @@ OLLAMA_PROFILE_SCHEMA=(
   "Context length|.context_length"
 )
 
+VLLM_PROFILE_SCHEMA=(
+  "Host|.host"
+  "Port|.port"
+  "Model|.model"
+  "Context length|.context_length"
+)
+
 # schema_display: thin wrapper that pins the canonical call shape across
 # backends. Takes a profile path and a schema array (spread with "${arr[@]}").
 schema_display() {
@@ -469,6 +476,117 @@ run_ollama() {
 }
 
 # ============================================================================
+# vLLM Backend
+# ============================================================================
+# vLLM exposes an OpenAI-compatible API at http://<host>:8000/v1.
+# Shape mirrors run_ollama() but defaults to port 8000 and tags profiles
+# as vllm-<slug>.json so they're distinguishable in the picker.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can assert on its
+# existence without triggering backend execution.
+
+run_vllm() {
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    local _pl_host _pl_port _pl_model _pl_ctx
+    _pl_host=$(jq -r '.host // ""' "$_PRELOADED_PROFILE")
+    _pl_port=$(jq -r '.port // "8000"' "$_PRELOADED_PROFILE")
+    _pl_model=$(jq -r '.model // ""' "$_PRELOADED_PROFILE")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+
+    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
+      echo "" >&2
+      echo "  [vllm] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
+      save_last_session "vllm" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
+      launch_claude exec "$_pl_model" "$_pl_host" "$_pl_port" "$_pl_ctx" "${passthrough_args[@]}"
+      return
+    fi
+    # Edit: fall through with defaults pre-filled
+  fi
+
+  # --- New session: collect host[:port] (vllm default port 8000) ---
+  local hp_default="${_pl_host:-localhost}${_pl_port:+:$_pl_port}"
+  [[ "$hp_default" == "localhost" ]] && hp_default="localhost:8000"
+  local hp
+  if [[ -n "${remote_host:-}" ]]; then
+    hp="${remote_host}:${_pl_port:-8000}"
+  else
+    hp=$(ask "vLLM endpoint (host or host:port, default port 8000)" "$hp_default")
+  fi
+  if [[ -z "$hp" ]]; then
+    echo "Host is required." >&2
+    exit 1
+  fi
+
+  local v_host v_port
+  if [[ "$hp" == *:* ]]; then
+    v_host="${hp%:*}"
+    v_port="${hp##*:}"
+  else
+    v_host="$hp"
+    v_port="8000"
+  fi
+  local v_url="http://${v_host}:${v_port}"
+
+  # --- Best-effort model picker via /v1/models (single try, short timeout) ---
+  local v_model="${_pl_model:-}"
+  local api_models
+  api_models=$(curl -sf --max-time 2 "${v_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
+
+  if [[ -n "$api_models" ]]; then
+    echo "" >&2
+    echo "Models on ${v_host}:${v_port}:" >&2
+    echo "" >&2
+    local -a model_list=()
+    local count=0 mid
+    while IFS= read -r mid; do
+      [[ -z "$mid" ]] && continue
+      count=$((count + 1))
+      model_list+=("$mid")
+      printf "  %d) %s\n" "$count" "$mid" >&2
+    done <<< "$api_models"
+    echo "  m) Enter model id manually" >&2
+    echo "" >&2
+    printf "Select (1-%d or m): " "$count" >&2
+    read -r selection
+    if [[ "$selection" == "m" || "$selection" == "M" ]]; then
+      v_model=$(ask "Model id" "$v_model")
+    elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
+      v_model="${model_list[$selection]}"
+    else
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+  else
+    echo "" >&2
+    echo "  (/v1/models unreachable or empty — enter model id manually)" >&2
+    v_model=$(ask "Model id" "$v_model")
+  fi
+
+  if [[ -z "$v_model" ]]; then
+    echo "Model id is required." >&2
+    exit 1
+  fi
+
+  # --- Context window ---
+  local v_ctx
+  v_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
+
+  # --- Save profile ---
+  local v_profile="$CONFIG_DIR/vllm-$(slug "${v_host}-${v_model}").json"
+  jq -n \
+    --arg host "$v_host" \
+    --arg port "$v_port" \
+    --arg model "$v_model" \
+    --arg ctx "$v_ctx" \
+    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$v_profile"
+  echo "" >&2
+  echo "Profile saved: $v_profile" >&2
+
+  save_last_session "vllm" "$(basename "$v_profile")" "$v_host" "$v_model"
+  launch_claude exec "$v_model" "$v_host" "$v_port" "$v_ctx" "${passthrough_args[@]}"
+}
+
+# ============================================================================
 # `cclm log` subcommand
 # ============================================================================
 # Summarize the append-only session log at $SESSION_LOG_FILE.
@@ -640,13 +758,13 @@ cmd_status() {
   echo "" >&2
   echo "Saved profiles (grouped by backend):" >&2
   local -a all_profiles
-  all_profiles=( "$CONFIG_DIR"/{lms,llama,zai,remote,ollama}-*.json(N) )
+  all_profiles=( "$CONFIG_DIR"/{lms,llama,zai,remote,ollama,vllm}-*.json(N) )
   if (( ${#all_profiles[@]} == 0 )); then
     echo "  (none)"
   else
     local be f base slug ctx count
     local -a group
-    for be in lms llama zai remote ollama; do
+    for be in lms llama zai remote ollama vllm; do
       group=( "$CONFIG_DIR"/${be}-*.json(N) )
       count=${#group[@]}
       (( count == 0 )) && continue
@@ -679,9 +797,10 @@ cmd_status() {
   k="localhost:1234";  endpoints[$k]=1     # LM Studio default
   k="localhost:8081";  endpoints[$k]=1     # llama.cpp default
   k="localhost:11434"; endpoints[$k]=1     # Ollama default
+  k="localhost:8000";  endpoints[$k]=1     # vLLM default
 
   local pf pbase pbe h p rh zurl
-  for pf in "$CONFIG_DIR"/{lms,llama,zai,remote,ollama}-*.json(N); do
+  for pf in "$CONFIG_DIR"/{lms,llama,zai,remote,ollama,vllm}-*.json(N); do
     pbase="${pf:t}"
     pbe="${pbase%%-*}"
     case "$pbe" in
@@ -697,12 +816,16 @@ cmd_status() {
         [[ -z "$p" || "$p" == "null" ]] && p="8081"
         k="${rh}:${p}"; endpoints[$k]=1
         ;;
-      remote|ollama)
+      remote|ollama|vllm)
         h=$(jq -r '.host // "localhost"' "$pf" 2>/dev/null || echo "localhost")
         p=$(jq -r '.port // ""' "$pf" 2>/dev/null || echo "")
         [[ -z "$h" || "$h" == "null" ]] && h="localhost"
         if [[ -z "$p" || "$p" == "null" ]]; then
-          [[ "$pbe" == "ollama" ]] && p="11434" || p="1234"
+          case "$pbe" in
+            ollama) p="11434" ;;
+            vllm)   p="8000" ;;
+            *)      p="1234" ;;
+          esac
         fi
         k="${h}:${p}"; endpoints[$k]=1
         ;;
@@ -760,6 +883,255 @@ cmd_status() {
 #   2 — `resume` requested but no last-session state exists; caller exits 1
 #
 # Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+# ----------------------------------------------------------------------------
+# Profile picker helpers
+# ----------------------------------------------------------------------------
+
+# _profile_display_line <profile_path>
+#   Prints the one-line summary for a saved profile to stdout, WITHOUT any
+#   leading index/tab. Shared by both the numbered fallback (which prepends
+#   "  NN) ") and the fzf feed (which prepends "<path>\t"). Keeping this in
+#   one place guarantees the two UIs render identically — per CLAUDE.md the
+#   numbered fallback must be preserved exactly, so any future formatting
+#   change here affects both UIs in lockstep.
+#
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call pick_profile
+# directly (see test/test_fzf_picker.zsh).
+_profile_display_line() {
+  local f="$1"
+  local base="${f:t}"
+  local be_tag model_name host_info ctx_info
+  case "$base" in
+    llama-*)  be_tag="llama" ;;
+    lms-*)    be_tag="lms" ;;
+    zai-*)    be_tag="zai" ;;
+    remote-*) be_tag="remote" ;;
+    ollama-*) be_tag="ollama" ;;
+    vllm-*)   be_tag="vllm" ;;
+  esac
+  case "$be_tag" in
+    llama)
+      model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
+      local rh=$(jq -r '.remote_host // empty' "$f")
+      host_info="${rh:+remote:$rh}"
+      [[ -z "$host_info" ]] && host_info="local"
+      ctx_info=$(jq -r '.ctx_len // "?"' "$f")
+      ;;
+    lms)
+      model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
+      local rh=$(jq -r '.remote_host // empty' "$f")
+      host_info="${rh:+remote:$rh}"
+      [[ -z "$host_info" ]] && host_info="local"
+      ctx_info=$(jq -r '.context_length // "?"' "$f")
+      ;;
+    zai)
+      model_name=$(jq -r '.sonnet_model // "?"' "$f")
+      host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
+      ctx_info=$(jq -r '.context_length // "?"' "$f")
+      ;;
+    remote)
+      model_name=$(jq -r '.model // "?"' "$f")
+      local rh_p=$(jq -r '.host // "?"' "$f")
+      local rp_p=$(jq -r '.port // "1234"' "$f")
+      host_info="${rh_p}:${rp_p}"
+      ctx_info=$(jq -r '.context_length // "?"' "$f")
+      ;;
+    ollama)
+      model_name=$(jq -r '.model // "?"' "$f")
+      local oh_p=$(jq -r '.host // "?"' "$f")
+      local op_p=$(jq -r '.port // "11434"' "$f")
+      host_info="${oh_p}:${op_p}"
+      ctx_info=$(jq -r '.context_length // "?"' "$f")
+      ;;
+    vllm)
+      model_name=$(jq -r '.model // "?"' "$f")
+      local vh_p=$(jq -r '.host // "?"' "$f")
+      local vp_p=$(jq -r '.port // "8000"' "$f")
+      host_info="${vh_p}:${vp_p}"
+      ctx_info=$(jq -r '.context_length // "?"' "$f")
+      ;;
+  esac
+  printf "[%-5s] %-28s %-21s ctx:%s" "$be_tag" \
+    "${model_name:0:28}" "$host_info" "$ctx_info"
+}
+
+# pick_profile: unified picker across all saved backend profiles.
+#   Returns 0 with globals (_PRELOADED_PROFILE, _PRELOADED_ACTION, backend) set,
+#   or 1 to fall through to the backend-selection menu.
+#
+# Two UIs are supported:
+#   1. fzf-powered fuzzy picker  (default when `fzf` is on PATH and stdin is a
+#      TTY). Keys: Enter=open, Ctrl-E=edit, Ctrl-D=delete, Esc=quit.
+#   2. Numbered fallback menu    (used when fzf is missing, CCLM_NO_FZF=1 is
+#      set, or stdin is not a TTY unless CCLM_FZF_FORCE=1 is set — the latter
+#      is a test-only hatch so pick_profile can be exercised via a piped stub).
+#
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+pick_profile() {
+  local -a profiles
+  profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama,vllm}-*.json(N) )
+
+  # No saved profiles — skip picker entirely
+  (( ${#profiles[@]} == 0 )) && return 1
+
+  # ---- fzf branch --------------------------------------------------------
+  # Gated on: fzf installed, CCLM_NO_FZF unset, and either stdin-is-a-TTY or
+  # the test-only CCLM_FZF_FORCE hatch. A stubbed `fzf` shell function beats
+  # the `command -v` check (it reports the function as a builtin-like hit),
+  # which is exactly how test/test_fzf_picker.zsh drives this path.
+  if [[ -z "${CCLM_NO_FZF:-}" ]] \
+     && command -v fzf >/dev/null 2>&1 \
+     && { [[ -t 0 ]] || [[ -n "${CCLM_FZF_FORCE:-}" ]]; }; then
+    while true; do
+      # Build tab-delimited feed: "<path>\t<display>". fzf shows only the
+      # display portion (--with-nth=2..) while the path travels through as
+      # the first field for unambiguous reverse lookup — avoids index games
+      # and survives duplicate model names across backends.
+      local feed="" f
+      for f in "${profiles[@]}"; do
+        feed+="${f}"$'\t'"$(_profile_display_line "$f")"$'\n'
+      done
+
+      local fzf_out key selection picked
+      fzf_out=$(printf '%s' "$feed" | fzf \
+        --prompt='Profile> ' \
+        --height=40% \
+        --reverse \
+        --header='Enter=open  Ctrl-E=edit  Ctrl-D=delete  Esc=cancel' \
+        --with-nth=2.. \
+        --delimiter=$'\t' \
+        --expect=ctrl-e,ctrl-d)
+
+      # Esc / no selection → quit (matches numbered menu's `q` behavior).
+      [[ -z "$fzf_out" ]] && exit 0
+
+      # fzf --expect contract: line 1 = key name (empty for Enter), line 2 =
+      # the selected input line.
+      key=$(printf '%s\n' "$fzf_out" | sed -n '1p')
+      selection=$(printf '%s\n' "$fzf_out" | sed -n '2p')
+      picked="${selection%%$'\t'*}"
+
+      [[ -z "$picked" || ! -f "$picked" ]] && exit 0
+
+      local picked_base="${picked:t}"
+      local picked_backend="${picked_base%%-*}"
+
+      case "$key" in
+        "")
+          _PRELOADED_PROFILE="$picked"
+          _PRELOADED_ACTION="open"
+          backend="$picked_backend"
+          return 0
+          ;;
+        ctrl-e)
+          _PRELOADED_PROFILE="$picked"
+          _PRELOADED_ACTION="edit"
+          backend="$picked_backend"
+          return 0
+          ;;
+        ctrl-d)
+          printf "  Delete %s? (y/N): " "$picked_base" >&2
+          local del_confirm
+          read -r del_confirm
+          if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+            rm "$picked"
+            echo "  Deleted." >&2
+            profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama,vllm}-*.json(N) )
+            (( ${#profiles[@]} == 0 )) && return 1
+          fi
+          continue
+          ;;
+        *) exit 0 ;;
+      esac
+    done
+  fi
+
+  # ---- numbered fallback (preserved exactly) -----------------------------
+  while true; do
+    echo "" >&2
+    echo "Saved profiles:" >&2
+    echo "" >&2
+
+    local i=1
+    for f in "${profiles[@]}"; do
+      printf "  %2d) %s\n" "$i" "$(_profile_display_line "$f")" >&2
+      (( i++ ))
+    done
+
+    echo "" >&2
+    echo "  n) New session (full config)" >&2
+    echo "  q) Quit" >&2
+    echo "" >&2
+    printf "Choice: " >&2
+    read -r choice
+
+    [[ "$choice" == "q" ]] && exit 0
+    [[ "$choice" == "n" ]] && return 1
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#profiles[@]} )); then
+      echo "Invalid selection." >&2
+      continue
+    fi
+
+    local picked="${profiles[$choice]}"
+    local picked_base="${picked:t}"
+    local picked_backend="${picked_base%%-*}"
+
+    # Action sub-menu
+    local display_model
+    case "$picked_backend" in
+      llama)  display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      lms)    display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      zai)    display_model=$(jq -r --arg b "$picked_base" '.sonnet_model // $b' "$picked") ;;
+      remote) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      ollama) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      vllm)   display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+    esac
+
+    echo "" >&2
+    echo "  [$picked_backend] $display_model" >&2
+    echo "    o) Open/launch" >&2
+    echo "    e) Edit parameters" >&2
+    echo "    d) Delete" >&2
+    echo "    b) Back to list" >&2
+    echo "" >&2
+    printf "  Action [o]: " >&2
+    read -r action
+    action="${action:-o}"
+
+    case "$action" in
+      o|O)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="open"
+        backend="$picked_backend"
+        return 0
+        ;;
+      e|E)
+        _PRELOADED_PROFILE="$picked"
+        _PRELOADED_ACTION="edit"
+        backend="$picked_backend"
+        return 0
+        ;;
+      d|D)
+        printf "  Delete %s? (y/N): " "$picked_base" >&2
+        read -r del_confirm
+        if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+          rm "$picked"
+          echo "  Deleted." >&2
+          # Refresh list
+          profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama,vllm}-*.json(N) )
+          (( ${#profiles[@]} == 0 )) && return 1
+        fi
+        # Reset counter and re-display
+        i=1
+        continue
+        ;;
+      b|B) i=1; continue ;;
+      *) echo "  Invalid action." >&2; continue ;;
+    esac
+  done
+}
+
 try_shortcut_dispatch() {
   local arg="${1:-}"
 
@@ -782,7 +1154,7 @@ try_shortcut_dispatch() {
   # profile file. E.g. `cclm lms-qwen` -> $CONFIG_DIR/lms-qwen.json.
   local prefix="${arg%%-*}"
   case "$prefix" in
-    lms|llama|zai|remote|ollama) ;;
+    lms|llama|zai|remote|ollama|vllm) ;;
     *) return 1 ;;
   esac
 
@@ -792,6 +1164,197 @@ try_shortcut_dispatch() {
   _PRELOADED_PROFILE="$candidate"
   _PRELOADED_ACTION="open"
   backend="$prefix"
+  return 0
+}
+
+# ============================================================================
+# `cclm edit` subcommand
+# ============================================================================
+# Targeted profile-field editor — avoids re-running the full backend flow just
+# to change one value.
+#
+#   cclm edit <slug>              interactive: numbered list, pick a field, prompt for value
+#   cclm edit <slug> <field>      direct: match by exact jq-key, else case-insensitive
+#                                 substring on key+label; ambiguous/missing -> exit 1
+#
+# Schema is the single source of truth for editable fields. Fields present in
+# the JSON but absent from the backend's PROFILE_SCHEMA are ignored. JSON type
+# is preserved across edits: numeric existing values stay numeric if the new
+# input parses as a number; string/null fields round-trip as strings.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+
+# Extract the jq key (e.g. "ctx_len") from a schema filter like ".ctx_len" or
+# `.slot_save_path // ""`. Returns the bare key with no leading dot, no
+# surrounding whitespace, no `// default` suffix.
+_cclm_schema_key() {
+  local f="$1"
+  # Drop anything from the first " //" onward.
+  f="${f%% //*}"
+  # Trim whitespace.
+  f="${f## }"; f="${f%% }"
+  # Strip leading dot.
+  f="${f#.}"
+  echo "$f"
+}
+
+# Merge a single key/value into a JSON profile file, preserving the existing
+# value's type where possible. Writes to a tmp file and atomically mvs.
+_cclm_profile_merge() {
+  local profile="$1" key="$2" new_val="$3"
+  local existing_type tmp
+  existing_type=$(jq -r --arg k "$key" '.[$k] | type' "$profile" 2>/dev/null || echo "null")
+  tmp=$(mktemp) || { echo "could not create tmp file" >&2; return 1; }
+
+  # Choose --arg (string) vs --argjson (typed). Preserve number/bool types
+  # when the new input is compatible; empty input against a currently-null
+  # field round-trips to null.
+  if [[ "$existing_type" == "number" && "$new_val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    jq --arg k "$key" --argjson v "$new_val" '.[$k] = $v' "$profile" > "$tmp"
+  elif [[ "$existing_type" == "boolean" && ( "$new_val" == "true" || "$new_val" == "false" ) ]]; then
+    jq --arg k "$key" --argjson v "$new_val" '.[$k] = $v' "$profile" > "$tmp"
+  elif [[ "$existing_type" == "null" && -z "$new_val" ]]; then
+    jq --arg k "$key" '.[$k] = null' "$profile" > "$tmp"
+  else
+    jq --arg k "$key" --arg v "$new_val" '.[$k] = $v' "$profile" > "$tmp"
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "jq failed to merge $key" >&2
+    return 1
+  fi
+  mv "$tmp" "$profile"
+}
+
+cmd_edit() {
+  local slug="${1:-}" field_arg="${2:-}"
+
+  if [[ -z "$slug" ]]; then
+    cat >&2 <<'EOF'
+Usage: cclm edit <slug> [field]
+
+Edit a single field of a saved profile without re-running the full flow.
+  cclm edit lms-qwen3                   # pick a field from the list
+  cclm edit llama-qwen3 ctx_len         # edit one field by jq-key
+  cclm edit remote-anthropic host       # substring/label match also works
+EOF
+    return 2
+  fi
+
+  # Check backend prefix BEFORE file existence — a typo like `bogus-foo`
+  # reports the specific "unknown backend prefix" instead of a generic
+  # "not found".
+  local prefix="${slug%%-*}"
+  local schema_var
+  case "$prefix" in
+    lms)    schema_var="LMS_PROFILE_SCHEMA" ;;
+    llama)  schema_var="LLAMA_PROFILE_SCHEMA_WITH_PATH" ;;
+    zai)    schema_var="ZAI_PROFILE_SCHEMA" ;;
+    remote) schema_var="REMOTE_PROFILE_SCHEMA" ;;
+    ollama) schema_var="OLLAMA_PROFILE_SCHEMA" ;;
+    vllm)   schema_var="VLLM_PROFILE_SCHEMA" ;;
+    *)
+      echo "cclm edit: unknown backend prefix '$prefix' (expected lms/llama/zai/remote/ollama/vllm)" >&2
+      return 1
+      ;;
+  esac
+
+  local profile="$CONFIG_DIR/${slug}.json"
+  if [[ ! -f "$profile" ]]; then
+    echo "cclm edit: profile not found: $profile" >&2
+    return 1
+  fi
+
+  # Indirect array expansion — same pattern as test/verify_golden.zsh.
+  local -a schema
+  schema=( "${(@P)schema_var}" )
+
+  # Parse schema into parallel arrays: labels, keys, filters.
+  local -a labels keys filters
+  local spec lbl flt grp k
+  for spec in "${schema[@]}"; do
+    IFS='|' read -r lbl flt grp <<< "$spec"
+    k=$(_cclm_schema_key "$flt")
+    labels+=("$lbl")
+    keys+=("$k")
+    filters+=("$flt")
+  done
+
+  # --- Resolve target field ------------------------------------------------
+  local idx=-1 i
+  if [[ -n "$field_arg" ]]; then
+    # 1. Exact jq-key match wins (keys are unique by construction).
+    for (( i=1; i<=${#keys[@]}; i++ )); do
+      if [[ "${keys[$i]}" == "$field_arg" ]]; then
+        idx=$i
+        break
+      fi
+    done
+
+    # 2. Fall back to case-insensitive substring match on key OR label.
+    if (( idx < 0 )); then
+      local -a matches
+      local needle="${field_arg:l}" hay_key hay_lbl
+      for (( i=1; i<=${#keys[@]}; i++ )); do
+        hay_key="${keys[$i]:l}"
+        hay_lbl="${labels[$i]:l}"
+        if [[ "$hay_key" == *"$needle"* || "$hay_lbl" == *"$needle"* ]]; then
+          matches+=("$i")
+        fi
+      done
+      if (( ${#matches[@]} == 0 )); then
+        echo "cclm edit: no field matches '$field_arg' in $prefix schema" >&2
+        echo "  Available fields:" >&2
+        for (( i=1; i<=${#keys[@]}; i++ )); do
+          printf "    %s (%s)\n" "${keys[$i]}" "${labels[$i]}" >&2
+        done
+        return 1
+      elif (( ${#matches[@]} > 1 )); then
+        echo "cclm edit: '$field_arg' is ambiguous — matches:" >&2
+        local m
+        for m in "${matches[@]}"; do
+          printf "    %s (%s)\n" "${keys[$m]}" "${labels[$m]}" >&2
+        done
+        return 1
+      fi
+      idx=${matches[1]}
+    fi
+  else
+    # Interactive selection.
+    echo "Profile: $profile" >&2
+    echo "Editable fields:" >&2
+    local cur
+    for (( i=1; i<=${#keys[@]}; i++ )); do
+      cur=$(jq -r "${filters[$i]}" "$profile" 2>/dev/null)
+      [[ -z "$cur" || "$cur" == "null" ]] && cur="-"
+      printf "  %2d) %-22s %s\n" "$i" "${labels[$i]}" "$cur" >&2
+    done
+    echo "" >&2
+    printf "Field # to edit (q to quit): " >&2
+    local choice
+    read -r choice
+    [[ "$choice" == "q" || -z "$choice" ]] && return 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
+      echo "cclm edit: invalid selection" >&2
+      return 1
+    fi
+    idx=$choice
+  fi
+
+  local target_key="${keys[$idx]}"
+  local target_lbl="${labels[$idx]}"
+  local target_flt="${filters[$idx]}"
+  local current
+  current=$(jq -r "$target_flt" "$profile" 2>/dev/null)
+  [[ "$current" == "null" ]] && current=""
+
+  local new_val
+  new_val=$(ask "$target_lbl" "$current")
+
+  if ! _cclm_profile_merge "$profile" "$target_key" "$new_val"; then
+    return 1
+  fi
+  echo "Updated $target_key in $(basename "$profile")." >&2
   return 0
 }
 
@@ -806,7 +1369,7 @@ try_shortcut_dispatch() {
 for f in "$CONFIG_DIR"/*.json(N); do
   _base="${f:t}"
   [[ "$_base" == .* ]] && continue
-  [[ "$_base" == lms-* || "$_base" == llama-* || "$_base" == zai-* || "$_base" == remote-* || "$_base" == ollama-* ]] && continue
+  [[ "$_base" == lms-* || "$_base" == llama-* || "$_base" == zai-* || "$_base" == remote-* || "$_base" == ollama-* || "$_base" == vllm-* ]] && continue
   [[ "$_base" != *-* ]] && continue
   mv "$f" "$CONFIG_DIR/lms-${_base}"
   echo "  [migrate] ${_base} -> lms-${_base}" >&2
@@ -842,6 +1405,12 @@ if [[ $# -ge 1 && "$1" == "status" ]]; then
   exit $?
 fi
 
+if [[ $# -ge 1 && "$1" == "edit" ]]; then
+  shift
+  cmd_edit "$@"
+  exit $?
+fi
+
 # Top-level shortcuts: `cclm resume` and `cclm <profile-slug>`. Both must
 # short-circuit the profile/backend pickers by pre-populating preload globals.
 # Explicit backend flags (--lms/--llama/...) take precedence — if any backend
@@ -852,7 +1421,7 @@ _PRELOADED_ACTION=""
 _has_backend_flag=false
 for _a in "$@"; do
   case "$_a" in
-    --lms|--llama|--zai|--remote|--ollama) _has_backend_flag=true; break ;;
+    --lms|--llama|--zai|--remote|--ollama|--vllm) _has_backend_flag=true; break ;;
   esac
 done
 unset _a
@@ -881,6 +1450,7 @@ while (( $# )); do
     --zai)    backend="zai" ;;
     --remote) backend="remote" ;;
     --ollama) backend="ollama" ;;
+    --vllm)   backend="vllm" ;;
     --dry-run|--print-env) DRY_RUN=true ;;
     --host)
       [[ $# -ge 2 ]] || { echo "--host requires an argument" >&2; exit 2; }
@@ -895,152 +1465,8 @@ export DRY_RUN
 # Load last session state (always returns 0; last_* may be empty on first run).
 load_last_session
 
-# ============================================================================
-# Profile Picker
-# ============================================================================
-
-pick_profile() {
-  # Scans all saved profiles and presents a unified picker.
-  # Returns 0 with globals set, or 1 to fall through to backend picker.
-  # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
-
-  local -a profiles
-  profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama}-*.json(N) )
-
-  # No saved profiles — skip picker entirely
-  (( ${#profiles[@]} == 0 )) && return 1
-
-  while true; do
-    echo "" >&2
-    echo "Saved profiles:" >&2
-    echo "" >&2
-
-    local i=1 be_tag model_name host_info ctx_info
-    for f in "${profiles[@]}"; do
-      local base="${f:t}"
-      case "$base" in
-        llama-*)  be_tag="llama" ;;
-        lms-*)    be_tag="lms" ;;
-        zai-*)    be_tag="zai" ;;
-        remote-*) be_tag="remote" ;;
-        ollama-*) be_tag="ollama" ;;
-      esac
-
-      case "$be_tag" in
-        llama)
-          model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
-          local rh=$(jq -r '.remote_host // empty' "$f")
-          host_info="${rh:+remote:$rh}"
-          [[ -z "$host_info" ]] && host_info="local"
-          ctx_info=$(jq -r '.ctx_len // "?"' "$f")
-          ;;
-        lms)
-          model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
-          local rh=$(jq -r '.remote_host // empty' "$f")
-          host_info="${rh:+remote:$rh}"
-          [[ -z "$host_info" ]] && host_info="local"
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-        zai)
-          model_name=$(jq -r '.sonnet_model // "?"' "$f")
-          host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-        remote)
-          model_name=$(jq -r '.model // "?"' "$f")
-          local rh_p=$(jq -r '.host // "?"' "$f")
-          local rp_p=$(jq -r '.port // "1234"' "$f")
-          host_info="${rh_p}:${rp_p}"
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-        ollama)
-          model_name=$(jq -r '.model // "?"' "$f")
-          local oh_p=$(jq -r '.host // "?"' "$f")
-          local op_p=$(jq -r '.port // "11434"' "$f")
-          host_info="${oh_p}:${op_p}"
-          ctx_info=$(jq -r '.context_length // "?"' "$f")
-          ;;
-      esac
-
-      printf "  %2d) [%-5s] %-28s %-21s ctx:%s\n" "$i" "$be_tag" \
-        "${model_name:0:28}" "$host_info" "$ctx_info" >&2
-      (( i++ ))
-    done
-
-    echo "" >&2
-    echo "  n) New session (full config)" >&2
-    echo "  q) Quit" >&2
-    echo "" >&2
-    printf "Choice: " >&2
-    read -r choice
-
-    [[ "$choice" == "q" ]] && exit 0
-    [[ "$choice" == "n" ]] && return 1
-
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#profiles[@]} )); then
-      echo "Invalid selection." >&2
-      continue
-    fi
-
-    local picked="${profiles[$choice]}"
-    local picked_base="${picked:t}"
-    local picked_backend="${picked_base%%-*}"
-
-    # Action sub-menu
-    local display_model
-    case "$picked_backend" in
-      llama)  display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
-      lms)    display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
-      zai)    display_model=$(jq -r --arg b "$picked_base" '.sonnet_model // $b' "$picked") ;;
-      remote) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
-      ollama) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
-    esac
-
-    echo "" >&2
-    echo "  [$picked_backend] $display_model" >&2
-    echo "    o) Open/launch" >&2
-    echo "    e) Edit parameters" >&2
-    echo "    d) Delete" >&2
-    echo "    b) Back to list" >&2
-    echo "" >&2
-    printf "  Action [o]: " >&2
-    read -r action
-    action="${action:-o}"
-
-    case "$action" in
-      o|O)
-        _PRELOADED_PROFILE="$picked"
-        _PRELOADED_ACTION="open"
-        backend="$picked_backend"
-        return 0
-        ;;
-      e|E)
-        _PRELOADED_PROFILE="$picked"
-        _PRELOADED_ACTION="edit"
-        backend="$picked_backend"
-        return 0
-        ;;
-      d|D)
-        printf "  Delete %s? (y/N): " "$picked_base" >&2
-        read -r del_confirm
-        if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
-          rm "$picked"
-          echo "  Deleted." >&2
-          # Refresh list
-          profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama}-*.json(N) )
-          (( ${#profiles[@]} == 0 )) && return 1
-        fi
-        # Reset counter and re-display
-        i=1
-        continue
-        ;;
-      b|B) i=1; continue ;;
-      *) echo "  Invalid action." >&2; continue ;;
-    esac
-  done
-}
-
 # --- Profile picker (runs first when no backend flag) ---
+# pick_profile() is defined above the CCLM_LIB_ONLY guard (see top of file).
 # Preload globals may already be populated by try_shortcut_dispatch (`cclm
 # resume` / `cclm <slug>`); only initialize if empty so we don't wipe them.
 : "${_PRELOADED_PROFILE:=}"
@@ -2413,4 +2839,5 @@ case "$backend" in
   zai)    run_zai ;;
   remote) run_remote ;;
   ollama) run_ollama ;;
+  vllm)   run_vllm ;;
 esac
