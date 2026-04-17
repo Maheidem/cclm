@@ -53,13 +53,15 @@ cclm manages all Claude Code env vars internally:
 - **Context**: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from profile's ctx length
 
 ### Profiles
-Plain JSON in `~/.config/cclm/` prefixed by backend:
+Plain JSON in `~/.config/cclm/` prefixed by backend. Any profile may also set an optional top-level `extends: "<base-slug>"` field to inherit from another profile of the same backend (deep-merge, child wins — see `_cclm_profile_resolve`).
 - LM Studio: `lms-<slug>.json` — fields: `model`, `context_length`, `gpu`, `parallel`, `ttl`, `identifier`
 - llama.cpp: `llama-<slug>.json` — fields: `model`, `ctx_len`, `gpu_layers`, `flash_attn`, `cache_type_*`, `swa_full`, `batch_size`, `temperature`, `port`, `parallel_slots`, etc.
 - Z.ai: `zai-<name>.json` — fields: `base_url`, `opus_model`, `sonnet_model`, `haiku_model`, `context_length`, `api_timeout_ms`
 - Remote: `remote-<slug>.json` — fields: `host`, `port`, `model`, `context_length`
 - Ollama: `ollama-<slug>.json` — fields: `host`, `port` (default `"11434"`), `model`, `context_length`
 - vLLM: `vllm-<slug>.json` — fields: `host`, `port` (default `"8000"`), `model`, `context_length`
+
+All profiles accept an optional `extends: "<base-slug>"` field (same-prefix parent required; resolution handled by `_cclm_profile_resolve`). Currently only the `ollama` backend consumes resolved JSON end-to-end via `_cclm_read_profile`; other backends still cat the file literally but can migrate incrementally (see `run_ollama`'s preload fast-path for the pattern).
 
 Example templates in `profiles/examples/`.
 

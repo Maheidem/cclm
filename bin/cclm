@@ -102,6 +102,47 @@ print_tier_routing() {
   printf "  %-7s → %s  (subagents)\n" "Haiku" "$3" >&2
 }
 
+# Validate an endpoint is reachable and (where applicable) confirms the model id.
+# Usage: _cclm_validate_endpoint <url> <model> <backend>
+# Returns 0 if reachable + model confirmed, 1 otherwise.
+# Silent on success. Callers are responsible for honoring DRY_RUN / CCLM_SKIP_VALIDATE.
+# Note: curl's --max-time 2 hard-caps every request, so a hanging endpoint
+# cannot stall profile creation for more than a couple seconds per probe.
+_cclm_validate_endpoint() {
+  local url="$1" model="$2" backend="$3"
+  case "$backend" in
+    llama)
+      curl -sf --max-time 2 "${url}/health" 2>/dev/null \
+        | jq -e '.status == "ok"' >/dev/null 2>&1
+      ;;
+    lms|remote|ollama|vllm)
+      curl -sf --max-time 2 "${url}/v1/models" 2>/dev/null \
+        | jq -e --arg m "$model" '.data[] | select(.id == $m)' >/dev/null 2>&1
+      ;;
+    zai)
+      # Best-effort: count_tokens may 404 on some deployments. Treat non-2xx
+      # as WARN (return 0) rather than FAIL so we don't block a known-good key.
+      # Requires ANTHROPIC_AUTH_TOKEN (or ZAI_API_KEY) in env for the x-api-key header.
+      local _zk="${ANTHROPIC_AUTH_TOKEN:-${ZAI_API_KEY:-}}"
+      curl -sf --max-time 2 -H "x-api-key: ${_zk}" "${url}/v1/messages/count_tokens" >/dev/null 2>&1
+      # Force success regardless — treat non-2xx as a warning, not a hard fail.
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Prompt the user to save an unreachable profile. Returns 0 if save should proceed, 1 otherwise.
+# Only called from the failure path of _cclm_validate_endpoint.
+_cclm_confirm_unreachable_save() {
+  local reply
+  printf "⚠  Endpoint not reachable or model not found. Save anyway? (y/N): " >&2
+  read -r reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
 # ============================================================================
 # Profile Schemas
 # Each backend declares a PROFILE_SCHEMA array of "label|jq_filter[|group]"
@@ -505,11 +546,35 @@ launch_claude() {
 run_ollama() {
   # --- Preload fast-path (from profile picker) ---
   if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    # Resolve the profile once (applies any `extends` chain) and re-point
+    # the jq reads at the resolved JSON. Falls back to the raw file if
+    # resolve fails so a typo in `extends` still surfaces as an error rather
+    # than silently corrupting the launch.
+    local resolved_file
+    resolved_file=$(mktemp -t cclm_resolved.XXXXXX) || {
+      echo "cclm: failed to create tmp file for profile resolve" >&2
+      return 1
+    }
+    # shellcheck disable=SC2064 — we want the resolved_file expanded now.
+    trap "rm -f '$resolved_file'" EXIT
+    if ! _cclm_read_profile "$_PRELOADED_PROFILE" > "$resolved_file" 2>/dev/null; then
+      # Re-run without suppression to surface the error, then fail.
+      _cclm_read_profile "$_PRELOADED_PROFILE" > /dev/null
+      rm -f "$resolved_file"
+      trap - EXIT
+      return 1
+    fi
+
     local _pl_host _pl_port _pl_model _pl_ctx
-    _pl_host=$(jq -r '.host // ""' "$_PRELOADED_PROFILE")
-    _pl_port=$(jq -r '.port // "11434"' "$_PRELOADED_PROFILE")
-    _pl_model=$(jq -r '.model // ""' "$_PRELOADED_PROFILE")
-    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+    _pl_host=$(jq -r '.host // ""' "$resolved_file")
+    _pl_port=$(jq -r '.port // "11434"' "$resolved_file")
+    _pl_model=$(jq -r '.model // ""' "$resolved_file")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$resolved_file")
+
+    # Values extracted — tmp file no longer needed. Drop it now so the
+    # `exec claude` at the end of launch_claude doesn't leak /tmp entries.
+    rm -f "$resolved_file"
+    trap - EXIT
 
     if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
       echo "" >&2
@@ -589,8 +654,16 @@ run_ollama() {
   local o_ctx
   o_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
 
-  # --- Save profile ---
+  # --- Save profile (with validation) ---
   local o_profile="$CONFIG_DIR/ollama-$(slug "${o_host}-${o_model}").json"
+  if [[ "${DRY_RUN:-false}" != "true" && "${CCLM_SKIP_VALIDATE:-0}" != "1" ]]; then
+    if ! _cclm_validate_endpoint "$o_url" "$o_model" "ollama"; then
+      if ! _cclm_confirm_unreachable_save; then
+        echo "Profile not saved. You can re-run cclm to try again." >&2
+        return 1
+      fi
+    fi
+  fi
   jq -n \
     --arg host "$o_host" \
     --arg port "$o_port" \
@@ -700,8 +773,16 @@ run_vllm() {
   local v_ctx
   v_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
 
-  # --- Save profile ---
+  # --- Save profile (with validation) ---
   local v_profile="$CONFIG_DIR/vllm-$(slug "${v_host}-${v_model}").json"
+  if [[ "${DRY_RUN:-false}" != "true" && "${CCLM_SKIP_VALIDATE:-0}" != "1" ]]; then
+    if ! _cclm_validate_endpoint "$v_url" "$v_model" "vllm"; then
+      if ! _cclm_confirm_unreachable_save; then
+        echo "Profile not saved. You can re-run cclm to try again." >&2
+        return 1
+      fi
+    fi
+  fi
   jq -n \
     --arg host "$v_host" \
     --arg port "$v_port" \
@@ -1955,6 +2036,116 @@ _cclm_valid_prefix() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Profile inheritance (optional `extends` field)
+#
+# A profile JSON may set `"extends": "<base-slug>"`. _cclm_profile_resolve
+# reads the profile, recursively resolves the parent (same backend prefix
+# required), and deep-merges with `jq -s '.[0] * .[1]'` so child keys win.
+# The merged output is emitted to stdout (the `extends` field is stripped).
+#
+# Cycle detection uses a comma-separated seen-set threaded through recursion.
+# A hard depth ceiling of 10 guards against runaway chains (distinct from a
+# cycle: you get a different error message).
+#
+# Backends opt in via `_cclm_read_profile` which accepts either an absolute
+# path or a slug and emits resolved JSON. Callers who only deal with flat
+# JSON can keep cat-ing files directly — extends is fully optional.
+# ---------------------------------------------------------------------------
+
+# _cclm_profile_resolve <slug>
+# Emits resolved JSON on stdout. Errors go to stderr; exit 1 on any failure
+# (missing file, cross-prefix extends, cycle, depth > 10).
+_cclm_profile_resolve() {
+  local slug="$1"
+  _cclm_profile_resolve_impl "$slug" 0 ""
+}
+
+# Internal: <slug> <depth> <seen_csv>
+_cclm_profile_resolve_impl() {
+  local slug="$1" depth="$2" seen="$3"
+
+  if (( depth > 10 )); then
+    echo "cclm: profile extends depth limit (10) exceeded at '$slug'" >&2
+    return 1
+  fi
+
+  if [[ -z "$slug" ]]; then
+    echo "cclm: profile resolve: empty slug" >&2
+    return 1
+  fi
+
+  # Cycle check: slug already in seen set?
+  case ",${seen}," in
+    *",${slug},"*)
+      echo "cclm: profile extends cycle detected involving '$slug' (chain: ${seen})" >&2
+      return 1
+      ;;
+  esac
+
+  local prefix="${slug%%-*}"
+  if ! _cclm_valid_prefix "$prefix"; then
+    echo "cclm: profile resolve: unknown backend prefix '$prefix' in '$slug'" >&2
+    return 1
+  fi
+
+  local pfile="$CONFIG_DIR/${slug}.json"
+  if [[ ! -f "$pfile" ]]; then
+    echo "cclm: profile resolve: profile not found: $pfile" >&2
+    return 1
+  fi
+
+  local parent
+  parent=$(jq -r '.extends // empty' "$pfile" 2>/dev/null || true)
+
+  if [[ -z "$parent" ]]; then
+    # Base case: no extends. Emit the JSON (strip any stray extends just in case).
+    jq 'del(.extends)' "$pfile"
+    return $?
+  fi
+
+  # Same-prefix guard: the parent slug must belong to the same backend.
+  local parent_prefix="${parent%%-*}"
+  if [[ "$parent_prefix" != "$prefix" ]]; then
+    echo "cclm: profile resolve: cross-backend extends not allowed ('$slug' [$prefix] extends '$parent' [$parent_prefix])" >&2
+    return 1
+  fi
+
+  # Resolve parent first (DFS), then deep-merge child on top.
+  local next_seen
+  if [[ -z "$seen" ]]; then
+    next_seen="$slug"
+  else
+    next_seen="${seen},${slug}"
+  fi
+
+  local parent_json
+  parent_json=$(_cclm_profile_resolve_impl "$parent" $((depth + 1)) "$next_seen") || return 1
+
+  # jq -s slurps both inputs as an array; `.[0] * .[1]` deep-merges with the
+  # second input (child) overriding the first (parent). Then strip `extends`.
+  jq -s '.[0] * .[1] | del(.extends)' \
+    <(printf '%s' "$parent_json") \
+    "$pfile"
+}
+
+# _cclm_read_profile <slug_or_path>
+# Thin wrapper backends can use instead of cat-ing a profile file directly.
+# Resolves `extends` transparently. Accepts either an absolute path (e.g.
+# from the profile picker's _PRELOADED_PROFILE) or a bare slug.
+_cclm_read_profile() {
+  local input="$1"
+  local slug
+  if [[ "$input" == /* || "$input" == */* ]]; then
+    # Path form: derive slug from basename, stripping .json.
+    slug="${input:t}"
+    slug="${slug%.json}"
+  else
+    slug="$input"
+  fi
+  _cclm_profile_resolve "$slug"
+}
+
 cmd_profile() {
   local sub="${1:-}"
   if [[ -z "$sub" ]]; then
@@ -1966,6 +2157,7 @@ Subcommands:
   clone <src> <dst>           Copy profile <src> to <dst> (same backend prefix).
   rename <old> <new>          Rename profile <old> to <new> (same backend prefix).
   delete <slug>               Delete profile <slug> (prompts unless FORCE=1).
+  resolve <slug>              Print profile JSON with `extends` applied.
 EOF
     return 2
   fi
@@ -1976,11 +2168,26 @@ EOF
     clone)  _cclm_profile_clone "$@" ;;
     rename) _cclm_profile_rename "$@" ;;
     delete|rm) _cclm_profile_delete "$@" ;;
+    resolve|show) _cclm_profile_resolve_cmd "$@" ;;
     *)
-      echo "cclm profile: unknown subcommand '$sub' (expected list/clone/rename/delete)" >&2
+      echo "cclm profile: unknown subcommand '$sub' (expected list/clone/rename/delete/resolve)" >&2
       return 2
       ;;
   esac
+}
+
+# `cclm profile resolve <slug>` — print resolved JSON (with extends applied)
+# to stdout. Validates prefix up front so typos get a clean error.
+_cclm_profile_resolve_cmd() {
+  local slug="${1:-}"
+  if [[ -z "$slug" ]]; then
+    echo "Usage: cclm profile resolve <slug>" >&2
+    return 2
+  fi
+  # Prefix validation (gives a clearer error than _cclm_profile_resolve's
+  # internal message if someone mistypes the backend tag).
+  _cclm_profile_prefix_of "$slug" "resolve" >/dev/null || return 1
+  _cclm_profile_resolve "$slug"
 }
 
 # List saved profiles grouped by backend. Mirrors the cmd_status section but
@@ -4043,8 +4250,16 @@ run_remote() {
   local r_ctx
   r_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
 
-  # --- Save profile ---
+  # --- Save profile (with validation) ---
   local r_profile="$CONFIG_DIR/remote-$(slug "${r_host}-${r_model}").json"
+  if [[ "${DRY_RUN:-false}" != "true" && "${CCLM_SKIP_VALIDATE:-0}" != "1" ]]; then
+    if ! _cclm_validate_endpoint "$r_url" "$r_model" "remote"; then
+      if ! _cclm_confirm_unreachable_save; then
+        echo "Profile not saved. You can re-run cclm to try again." >&2
+        return 1
+      fi
+    fi
+  fi
   jq -n \
     --arg host "$r_host" \
     --arg port "$r_port" \

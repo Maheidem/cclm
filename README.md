@@ -259,6 +259,34 @@ Each profile captures model identifiers, server parameters, and (for remote setu
 
 Example templates live in `profiles/examples/`.
 
+### Profile inheritance (`extends`)
+
+Any profile JSON may set an optional top-level `extends: "<base-slug>"` field. When cclm loads the profile it reads the base, then deep-merges the child on top (child keys override). The base must belong to the **same backend** (e.g. an `ollama-*` profile can only extend another `ollama-*`). Chains are supported up to 10 levels deep; cycles are rejected.
+
+`~/.config/cclm/ollama-base.json`:
+
+```json
+{
+  "host": "localhost",
+  "port": "11434",
+  "model": "llama3.1:70b",
+  "context_length": 65536
+}
+```
+
+`~/.config/cclm/ollama-big-ctx.json`:
+
+```json
+{
+  "extends": "ollama-base",
+  "context_length": 262144
+}
+```
+
+Launching `ollama-big-ctx` inherits host/port/model from the base and overrides the context window. The profile picker still shows the file-literal values (so you can see at a glance what's overridden); to inspect the merged result, run `cclm profile resolve <slug>` — it prints the resolved JSON on stdout.
+
+> Currently wired end-to-end for the `ollama` backend. Other backends still read profile files directly; `extends` is ignored there until they're migrated.
+
 ### Per-profile MCP servers
 
 Any profile JSON may carry an optional top-level `mcp_servers` object mapping server name to server config. When cclm loads a profile that has this field, it merges the entries into `~/.claude.json`'s `mcpServers` (after backing the original up to `~/.claude.json.cclm-backup`) so Claude Code sees exactly the MCP servers you want per profile. Same-named servers are overridden by the profile — profile wins.
@@ -296,15 +324,15 @@ The configure step will offer "same as Opus/Sonnet" shortcuts so you don't have 
 
 ### Generic remote (`--remote`)
 
-Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, model name per tier, `context_length`, and `api_timeout_ms`. Stored as `remote-<slug>.json`.
+Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, model name per tier, `context_length`, and `api_timeout_ms`. Stored as `remote-<slug>.json`. Before writing the profile cclm probes `<url>/v1/models` (≤2s) and confirms the chosen model id is present; if it isn't, you're prompted to save anyway. Set `CCLM_SKIP_VALIDATE=1` to bypass the probe in offline workflows.
 
 ### Ollama (`--ollama`)
 
-Ollama exposes an OpenAI-compatible API at `http://<host>:11434/v1`. cclm prompts for `host[:port]` (default `localhost:11434`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `ollama-<slug>.json`. Start Ollama with `ollama serve` before launching.
+Ollama exposes an OpenAI-compatible API at `http://<host>:11434/v1`. cclm prompts for `host[:port]` (default `localhost:11434`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `ollama-<slug>.json`. Start Ollama with `ollama serve` before launching. Before writing the profile cclm probes `<url>/v1/models` (≤2s) and confirms the chosen model id is present; if it isn't, you're prompted to save anyway. Set `CCLM_SKIP_VALIDATE=1` to bypass the probe in offline workflows.
 
 ### vLLM (`--vllm`)
 
-vLLM exposes an OpenAI-compatible API at `http://<host>:8000/v1`. cclm prompts for `host[:port]` (default `localhost:8000`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `vllm-<slug>.json`. Start vLLM with `vllm serve <model>` (or your usual `python -m vllm.entrypoints.openai.api_server …` invocation) before launching.
+vLLM exposes an OpenAI-compatible API at `http://<host>:8000/v1`. cclm prompts for `host[:port]` (default `localhost:8000`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `vllm-<slug>.json`. Start vLLM with `vllm serve <model>` (or your usual `python -m vllm.entrypoints.openai.api_server …` invocation) before launching. Before writing the profile cclm probes `<url>/v1/models` (≤2s) and confirms the chosen model id is present; if it isn't, you're prompted to save anyway. Set `CCLM_SKIP_VALIDATE=1` to bypass the probe in offline workflows.
 
 ### LM Studio / llama.cpp remote
 
