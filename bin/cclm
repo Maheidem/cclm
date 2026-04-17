@@ -13,6 +13,10 @@ set -euo pipefail
 CONFIG_DIR="$HOME/.config/cclm"
 MODELS_DIR="${CCLM_MODELS_DIR:-$HOME/.cache/lm-studio/models}"
 STATE_FILE="$CONFIG_DIR/.last_session"
+# Path to Claude Code's global config (where mcpServers lives) and its backup.
+# Overridable for tests; real users never need to touch these.
+CCLM_CLAUDE_CONFIG="${CCLM_CLAUDE_CONFIG:-$HOME/.claude.json}"
+CCLM_CLAUDE_BACKUP="${CCLM_CLAUDE_BACKUP:-$HOME/.claude.json.cclm-backup}"
 mkdir -p "$CONFIG_DIR"
 
 # Portable file size: macOS `stat -f%z`, Linux `stat -c%s`
@@ -266,6 +270,118 @@ log_session() {
   return 0
 }
 
+# ============================================================================
+# Per-profile MCP servers
+# ============================================================================
+# Profiles may optionally carry an `mcp_servers` JSON object (name -> config).
+# When present, apply_mcp_servers merges it into Claude Code's global config
+# (`~/.claude.json` .mcpServers), after backing the original up so we can
+# restore on exit or on next cclm run.
+#
+# IMPORTANT: launch_claude ends with `exec claude` which replaces this shell,
+# so the EXIT trap set here never fires on a successful launch. The backup is
+# instead picked up at the NEXT cclm startup (see the stale-backup guard below
+# the CCLM_LIB_ONLY return). The EXIT trap exists only to handle the cclm-dies-
+# before-exec case (jq merge failure, dry-run, signal).
+
+# Restore the original claude.json from backup if one exists. Idempotent / no-op
+# when there's nothing to restore. Called from the EXIT trap and from startup.
+restore_claude_config() {
+  [[ -f "$CCLM_CLAUDE_BACKUP" ]] || return 0
+  # Backup may be a zero-byte marker — meaning claude.json didn't exist at
+  # merge time — in which case "restore" means deleting the file we created.
+  if [[ ! -s "$CCLM_CLAUDE_BACKUP" ]]; then
+    rm -f "$CCLM_CLAUDE_CONFIG"
+    rm -f "$CCLM_CLAUDE_BACKUP"
+    return 0
+  fi
+  mv -f "$CCLM_CLAUDE_BACKUP" "$CCLM_CLAUDE_CONFIG" 2>/dev/null \
+    || { echo "cclm: failed to restore $CCLM_CLAUDE_CONFIG from backup" >&2; return 1; }
+  return 0
+}
+
+# Merge .mcp_servers from a profile into ~/.claude.json's .mcpServers.
+# Args: profile_path
+# - Returns 0 and does nothing when the profile has no .mcp_servers.
+# - Backs up the existing claude.json (overwriting any prior backup) before
+#   writing. If the claude.json is missing, a zero-byte marker backup is used
+#   so restore knows to delete rather than restore.
+# - On DRY_RUN=true, prints what WOULD be written to stdout and skips writes.
+# - On any jq failure, prints an error and returns non-zero so callers abort.
+apply_mcp_servers() {
+  local profile="$1"
+  [[ -f "$profile" ]] || return 0
+
+  local add
+  add=$(jq -c '.mcp_servers // empty' "$profile" 2>/dev/null) || {
+    echo "cclm: failed to read mcp_servers from $profile" >&2
+    return 1
+  }
+  # No mcp_servers field (or explicit null/empty) — nothing to do.
+  [[ -z "$add" || "$add" == "null" ]] && return 0
+
+  # Read current claude.json; treat missing/empty as {}.
+  local current="{}"
+  if [[ -f "$CCLM_CLAUDE_CONFIG" ]]; then
+    current=$(jq -c '.' "$CCLM_CLAUDE_CONFIG" 2>/dev/null) || {
+      echo "cclm: $CCLM_CLAUDE_CONFIG is not valid JSON — aborting" >&2
+      return 1
+    }
+  fi
+
+  # Merge: RHS wins on same-named keys → profile overrides any existing server
+  # with the same name. This is the `+` semantics for jq objects.
+  local merged
+  merged=$(jq -n --argjson cur "$current" --argjson add "$add" \
+    '$cur + {mcpServers: (($cur.mcpServers // {}) + $add)}' 2>/dev/null) || {
+    echo "cclm: failed to merge mcp_servers into $CCLM_CLAUDE_CONFIG" >&2
+    return 1
+  }
+
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    echo "# --- would write to $CCLM_CLAUDE_CONFIG ---" >&2
+    echo "$merged"
+    return 0
+  fi
+
+  # Back up (overwriting any stale backup) before any write.
+  if [[ -f "$CCLM_CLAUDE_CONFIG" ]]; then
+    cp -f "$CCLM_CLAUDE_CONFIG" "$CCLM_CLAUDE_BACKUP" || {
+      echo "cclm: failed to back up $CCLM_CLAUDE_CONFIG" >&2
+      return 1
+    }
+  else
+    # Record absence so restore removes the file we created (zero-byte marker).
+    : > "$CCLM_CLAUDE_BACKUP" || {
+      echo "cclm: failed to create backup marker at $CCLM_CLAUDE_BACKUP" >&2
+      return 1
+    }
+  fi
+
+  # Mark the backup as "live" — the shell-level TRAPEXIT / TRAPINT / TRAPTERM
+  # hooks installed at global scope (below the CCLM_LIB_ONLY guard) check this
+  # flag and restore on cclm exit. zsh scopes `trap … EXIT` and `TRAPEXIT`
+  # function definitions to the enclosing function (unlike bash), so setting
+  # the trap from inside apply_mcp_servers would fire at function return — not
+  # at cclm exit. Instead we rely on the module-level hooks reading this flag.
+  # On a successful `exec claude` the flag is discarded with the replaced
+  # process; the next cclm startup sees the stale backup and restores it.
+  _CCLM_MCP_ARMED=1
+
+  # Atomic write via tempfile to keep claude.json intact if disk fills mid-write.
+  local _tmp
+  _tmp=$(mktemp 2>/dev/null) || {
+    echo "cclm: failed to create temp file for claude.json write" >&2
+    return 1
+  }
+  printf '%s\n' "$merged" > "$_tmp" && mv -f "$_tmp" "$CCLM_CLAUDE_CONFIG" || {
+    rm -f "$_tmp"
+    echo "cclm: failed to write $CCLM_CLAUDE_CONFIG" >&2
+    return 1
+  }
+  return 0
+}
+
 # Set env vars and launch claude. Args: mode, api_id, host, port, context_length, extra_claude_args...
 # mode is "exec" (replaces process) or "fg" (foreground, returns when done)
 launch_claude() {
@@ -336,6 +452,19 @@ launch_claude() {
   echo "Backend: $ANTHROPIC_BASE_URL" >&2
   echo "Context: ${ctx} tokens  (CLAUDE_CODE_AUTO_COMPACT_WINDOW=${ctx})" >&2
   echo "" >&2
+
+  # Merge per-profile MCP servers into ~/.claude.json (no-op if the profile
+  # lacks `.mcp_servers`). Runs before DRY_RUN so dry-runs still surface what
+  # WOULD be written. Hard-fail on jq errors — don't exec claude with a busted
+  # config. The EXIT trap is installed inside apply_mcp_servers after a
+  # successful backup; `exec claude` below discards the trap on success, and
+  # the next cclm startup restores from the backup (see stale-backup guard).
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    if ! apply_mcp_servers "$_PRELOADED_PROFILE"; then
+      echo "cclm: refusing to launch claude with an unmerged MCP config" >&2
+      exit 1
+    fi
+  fi
 
   # --dry-run / --print-env: print the env vars cclm manages and the command
   # that WOULD have been exec'd, then exit 0 without invoking claude.
@@ -1168,6 +1297,130 @@ try_shortcut_dispatch() {
 }
 
 # ============================================================================
+# Per-project .cclmrc auto-selection
+# ============================================================================
+# When invoked with no explicit backend flag and no matching positional slug,
+# cclm walks up from $PWD looking for a .cclmrc file. Discovery stops when one
+# is found, at $HOME, or at /. The file format is a line-oriented key=value
+# config; supported keys: `profile=<slug>` (equivalent to `cclm <slug>`) and
+# `backend=<lms|llama|zai|remote|ollama|vllm>` (equivalent to `cclm --<backend>`).
+# Lines starting with `#` are comments; blank lines are ignored. Malformed files
+# print a warning and fall through to the interactive picker.
+#
+# Symlinked cwd: uses logical $PWD (the user's mental cd path), not `pwd -P`,
+# matching how tools like git resolve the working directory.
+# Defined above the CCLM_LIB_ONLY guard so tests can drive these directly.
+
+# Walk up from $1 (absolute start dir), looking for .cclmrc. Stop at $HOME or /.
+# Echoes the discovered path on stdout (rc=0) or nothing (rc=1).
+find_cclmrc() {
+  local rcdir="${1:-$PWD}"
+  # Normalize: if not absolute, prefix with PWD. We intentionally do NOT call
+  # `realpath`/`pwd -P` here — users `cd` through symlinks and expect the
+  # logical path to be honored (e.g. git's rev-parse behavior).
+  [[ "$rcdir" == /* ]] || rcdir="$PWD/$rcdir"
+
+  local home="${HOME:-}"
+  while [[ -n "$rcdir" ]]; do
+    if [[ -f "$rcdir/.cclmrc" ]]; then
+      echo "$rcdir/.cclmrc"
+      return 0
+    fi
+    # Stop boundaries: we check $HOME itself (above), then break. Similarly
+    # we stop at root once we've checked it.
+    [[ "$rcdir" == "$home" ]] && return 1
+    [[ "$rcdir" == "/" ]] && return 1
+    # Trim the last path segment; `${rcdir:h}` yields "/" when rcdir is "/foo".
+    local parent="${rcdir:h}"
+    # Guard against stuck loops (shouldn't happen, but cheap insurance).
+    [[ "$parent" == "$rcdir" ]] && return 1
+    rcdir="$parent"
+  done
+  return 1
+}
+
+# Parse a .cclmrc file at $1 and, on success, set the preload globals that the
+# dispatch path already uses (backend, _PRELOADED_PROFILE, _PRELOADED_ACTION).
+# Returns 0 on successful resolution, 1 on any malformed/invalid content (with
+# a stderr warning so the user knows why the picker showed up anyway).
+#
+# Precedence when both keys are present: `profile=` wins over `backend=` —
+# profile is strictly more specific (carries the backend prefix + the slug).
+apply_cclmrc() {
+  local rcpath="$1"
+  [[ -f "$rcpath" ]] || { echo "cclm: .cclmrc not found: $rcpath" >&2; return 1; }
+
+  local rcprofile="" rcbackend=""
+  local lineno=0 line key rcvalue
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno + 1))
+    # Strip leading/trailing whitespace. We avoid extended_glob quantifiers
+    # (not enabled globally) and just loop off one char at a time — rc files
+    # are tiny, this is a non-hotpath.
+    while [[ "$line" == [[:space:]]* ]]; do line="${line#?}"; done
+    while [[ "$line" == *[[:space:]] ]]; do line="${line%?}"; done
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    # Must contain `=`, with a key matching [a-z_][a-z_0-9]* before it. We
+    # avoid zsh's extended_glob `#` operator (not enabled globally in this
+    # script) and do the split-then-validate dance instead.
+    if [[ "$line" != *=* ]]; then
+      echo "cclm: warning: $rcpath:$lineno malformed line: $line" >&2
+      return 1
+    fi
+    key="${line%%=*}"
+    rcvalue="${line#*=}"
+    if [[ -z "$key" || "$key" == [^a-z_]* || "$key" == *[^a-z_0-9]* ]]; then
+      echo "cclm: warning: $rcpath:$lineno malformed key: $key" >&2
+      return 1
+    fi
+    case "$key" in
+      profile) rcprofile="$rcvalue" ;;
+      backend) rcbackend="$rcvalue" ;;
+      *)
+        # Unknown keys are a warning, not an error (forward compat).
+        echo "cclm: warning: $rcpath:$lineno unknown key: $key" >&2
+        ;;
+    esac
+  done < "$rcpath"
+
+  # `profile=` takes precedence — reuse try_shortcut_dispatch's validation so
+  # we enforce the known-prefix rule and the file-exists check in one place.
+  if [[ -n "$rcprofile" ]]; then
+    local prefix="${rcprofile%%-*}"
+    case "$prefix" in
+      lms|llama|zai|remote|ollama|vllm) ;;
+      *)
+        echo "cclm: warning: $rcpath: profile '$rcprofile' lacks a known backend prefix" >&2
+        return 1
+        ;;
+    esac
+    local candidate="$CONFIG_DIR/${rcprofile}.json"
+    if [[ ! -f "$candidate" ]]; then
+      echo "cclm: warning: $rcpath: profile '$rcprofile' not found at $candidate" >&2
+      return 1
+    fi
+    _PRELOADED_PROFILE="$candidate"
+    _PRELOADED_ACTION="open"
+    backend="$prefix"
+    return 0
+  fi
+
+  if [[ -n "$rcbackend" ]]; then
+    case "$rcbackend" in
+      lms|llama|zai|remote|ollama|vllm) backend="$rcbackend"; return 0 ;;
+      *)
+        echo "cclm: warning: $rcpath: unknown backend '$rcbackend'" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  # File was well-formed but specified nothing actionable.
+  echo "cclm: warning: $rcpath: no profile= or backend= directive" >&2
+  return 1
+}
+
+# ============================================================================
 # `cclm edit` subcommand
 # ============================================================================
 # Targeted profile-field editor — avoids re-running the full backend flow just
@@ -1993,9 +2246,290 @@ _cclm_lms_render_model_picker() {
   printf '%d\t%s\t%d\n' "$default_idx" "$show_synthetic" "$count"
 }
 
+# ============================================================================
+# `cclm keys` subcommand — secure credential storage
+# ============================================================================
+# Manages API keys via the system credential store. Backend is detected by
+# capability (command -v) not $OSTYPE — keeps PATH-shim tests clean.
+#
+# Backend precedence:
+#   1. `security`     — macOS Keychain (service name: "cclm-<name>")
+#   2. `secret-tool`  — Linux libsecret (service=cclm, name=<name>)
+#   3. file fallback  — $CONFIG_DIR/keys/<name> with mode 600 (dir 700)
+#
+# `_cclm_get_key` additionally falls back to env var <NAME_UPPER>_API_KEY
+# between the credential store and the file fallback, so existing users with
+# `ZAI_API_KEY` in their shell keep working with zero config changes.
+#
+# Secrets are never printed to stderr. Only `cclm keys get` writes to stdout.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call them directly.
+
+# Pick a credential backend once. Echoes one of: security, secret-tool, file.
+_cclm_keys_backend() {
+  if (( $+commands[security] )); then
+    echo security
+  elif (( $+commands[secret-tool] )); then
+    echo secret-tool
+  else
+    echo file
+  fi
+}
+
+# File-fallback path resolver. Avoids `local path=...` (zsh PATH gotcha).
+_cclm_keys_file_path() {
+  echo "$CONFIG_DIR/keys/$1"
+}
+
+# Get a secret by name. Order: keychain/secret-tool, env var, file, empty.
+# Prints secret to stdout (empty if not found). Never logs anything.
+_cclm_get_key() {
+  local name="$1"
+  [[ -z "$name" ]] && return 0
+  local backend secret="" env_name key_file
+  backend="$(_cclm_keys_backend)"
+
+  case "$backend" in
+    security)
+      secret=$(security find-generic-password -a "$USER" -s "cclm-$name" -w 2>/dev/null || true)
+      ;;
+    secret-tool)
+      secret=$(secret-tool lookup service cclm name "$name" 2>/dev/null || true)
+      ;;
+  esac
+
+  if [[ -z "$secret" ]]; then
+    # Env-var fallback: e.g. name=zai -> $ZAI_API_KEY.
+    env_name="${(U)name}_API_KEY"
+    secret="${(P)env_name:-}"
+  fi
+
+  if [[ -z "$secret" ]]; then
+    key_file="$(_cclm_keys_file_path "$name")"
+    if [[ -r "$key_file" ]]; then
+      secret=$(<"$key_file")
+    fi
+  fi
+
+  printf '%s' "$secret"
+}
+
+# `cclm keys add <name>`: prompt for a secret (input hidden) and store it.
+_cclm_keys_add() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo "Usage: cclm keys add <name>" >&2
+    return 2
+  fi
+  printf "Enter secret for '%s' (input hidden): " "$name" >&2
+  local secret
+  read -rs secret
+  echo "" >&2
+  if [[ -z "$secret" ]]; then
+    echo "No secret provided; aborting." >&2
+    return 1
+  fi
+
+  local backend
+  backend="$(_cclm_keys_backend)"
+  case "$backend" in
+    security)
+      # -U updates the existing entry instead of erroring on duplicate.
+      if security add-generic-password -a "$USER" -s "cclm-$name" -w "$secret" -U >/dev/null 2>&1; then
+        echo "Stored '$name' in macOS Keychain (service: cclm-$name)." >&2
+      else
+        echo "Failed to store '$name' in Keychain." >&2
+        unset secret
+        return 1
+      fi
+      ;;
+    secret-tool)
+      if printf '%s' "$secret" | secret-tool store --label "cclm/$name" service cclm name "$name" >/dev/null 2>&1; then
+        echo "Stored '$name' via libsecret (service=cclm, name=$name)." >&2
+      else
+        echo "Failed to store '$name' via secret-tool." >&2
+        unset secret
+        return 1
+      fi
+      ;;
+    file)
+      local key_dir key_file
+      key_dir="$CONFIG_DIR/keys"
+      key_file="$(_cclm_keys_file_path "$name")"
+      mkdir -p "$key_dir"
+      chmod 700 "$key_dir" 2>/dev/null || true
+      # Restrict perms while writing — never widen the window.
+      (umask 077 && printf '%s' "$secret" > "$key_file")
+      chmod 600 "$key_file" 2>/dev/null || true
+      echo "Warning: no system credential store available." >&2
+      echo "  Stored '$name' at $key_file (mode 600). Consider installing" >&2
+      echo "  the 'security' (macOS) or 'secret-tool' (Linux) tool." >&2
+      ;;
+  esac
+  unset secret
+  return 0
+}
+
+# `cclm keys remove <name>`: delete stored secret from primary backend + file.
+_cclm_keys_remove() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo "Usage: cclm keys remove <name>" >&2
+    return 2
+  fi
+  local removed=false backend
+  backend="$(_cclm_keys_backend)"
+
+  case "$backend" in
+    security)
+      if security delete-generic-password -a "$USER" -s "cclm-$name" >/dev/null 2>&1; then
+        echo "Removed '$name' from macOS Keychain." >&2
+        removed=true
+      fi
+      ;;
+    secret-tool)
+      if secret-tool clear service cclm name "$name" >/dev/null 2>&1; then
+        echo "Removed '$name' from libsecret." >&2
+        removed=true
+      fi
+      ;;
+  esac
+
+  # Always sweep file fallback too — user may have mixed backends over time.
+  local key_file
+  key_file="$(_cclm_keys_file_path "$name")"
+  if [[ -f "$key_file" ]]; then
+    rm -f "$key_file"
+    echo "Removed $key_file." >&2
+    removed=true
+  fi
+
+  if ! $removed; then
+    echo "No stored key named '$name' found." >&2
+    return 1
+  fi
+  return 0
+}
+
+# `cclm keys list`: print names only, never values. One per line on stdout.
+_cclm_keys_list() {
+  local backend found=false
+  backend="$(_cclm_keys_backend)"
+
+  case "$backend" in
+    security)
+      # dump-keychain is noisy and may prompt; best-effort grep for cclm-*.
+      local dump
+      dump=$(security dump-keychain 2>/dev/null | grep -oE '"svce"<blob>="cclm-[^"]+"' 2>/dev/null || true)
+      if [[ -n "$dump" ]]; then
+        echo "$dump" | sed -E 's/.*"cclm-([^"]+)".*/\1/' | sort -u
+        found=true
+      fi
+      ;;
+    secret-tool)
+      local search
+      search=$(secret-tool search --all service cclm 2>/dev/null | awk -F' = ' '/^attribute\.name /{print $2}' | sort -u || true)
+      if [[ -n "$search" ]]; then
+        echo "$search"
+        found=true
+      fi
+      ;;
+  esac
+
+  # Also enumerate file fallbacks (mixed-backend or no-keychain environments).
+  local key_dir="$CONFIG_DIR/keys"
+  if [[ -d "$key_dir" ]]; then
+    local f
+    for f in "$key_dir"/*(N); do
+      [[ -f "$f" ]] || continue
+      echo "${f:t}"
+      found=true
+    done
+  fi
+
+  if ! $found; then
+    echo "No cclm keys stored." >&2
+    return 0
+  fi
+  return 0
+}
+
+# `cclm keys get <name>`: print secret on stdout (scripting / internal use).
+_cclm_keys_get() {
+  local name="$1"
+  if [[ -z "$name" ]]; then
+    echo "Usage: cclm keys get <name>" >&2
+    return 2
+  fi
+  local secret
+  secret="$(_cclm_get_key "$name")"
+  if [[ -z "$secret" ]]; then
+    echo "No key named '$name' found." >&2
+    return 1
+  fi
+  printf '%s\n' "$secret"
+  return 0
+}
+
+cmd_keys() {
+  local sub="${1:-}"
+  if [[ -z "$sub" || "$sub" == "-h" || "$sub" == "--help" ]]; then
+    cat >&2 <<'EOF'
+Usage: cclm keys <subcommand> [args...]
+
+Subcommands:
+  add <name>      Store a secret (prompts, input hidden).
+  get <name>      Print a stored secret to stdout.
+  list            List stored key names (values never shown).
+  remove <name>   Delete a stored secret.
+
+Backends (auto-detected):
+  macOS: security (Keychain), Linux: secret-tool (libsecret),
+  fallback: $CONFIG_DIR/keys/<name> (mode 600).
+EOF
+    [[ -z "$sub" ]] && return 2
+    return 0
+  fi
+  shift
+  case "$sub" in
+    add)    _cclm_keys_add "$@" ;;
+    get)    _cclm_keys_get "$@" ;;
+    list)   _cclm_keys_list "$@" ;;
+    remove|rm|delete) _cclm_keys_remove "$@" ;;
+    *)
+      echo "Unknown keys subcommand: $sub" >&2
+      echo "Run 'cclm keys --help' for usage." >&2
+      return 2
+      ;;
+  esac
+}
+
 # When sourced for tests (CCLM_LIB_ONLY=1), return here — helpers are defined,
 # main execution (migration, arg parsing, backend dispatch) is skipped.
 [[ "${CCLM_LIB_ONLY:-0}" == "1" ]] && return 0
+
+# Stale-backup recovery: the EXIT trap below never fires on the success path
+# (exec claude replaces the process), so a previous invocation that merged
+# mcp_servers leaves its backup on disk. Restore it before anyone touches
+# ~/.claude.json this run.
+if [[ -f "$CCLM_CLAUDE_BACKUP" ]]; then
+  echo "cclm: restoring ${CCLM_CLAUDE_CONFIG} from previous session backup." >&2
+  restore_claude_config || true
+fi
+
+# Shell-level EXIT / INT / TERM hooks for per-profile MCP merges. These must be
+# defined at GLOBAL scope (not inside a function) because zsh scopes trap/
+# TRAPEXIT definitions to the enclosing function. Fires only when
+# apply_mcp_servers set `_CCLM_MCP_ARMED=1` on the active shell — meaning we
+# actually merged something and didn't reach `exec claude`. The subshell guard
+# prevents the hook running inside every $(…) command substitution.
+_cclm_mcp_on_exit() {
+  (( ZSH_SUBSHELL == 0 )) || return 0
+  [[ "${_CCLM_MCP_ARMED:-0}" == "1" ]] || return 0
+  restore_claude_config
+}
+trap '_cclm_mcp_on_exit'                                          EXIT
+trap '_cclm_mcp_on_exit; trap - INT;  kill -INT  $$'              INT
+trap '_cclm_mcp_on_exit; trap - TERM; kill -TERM $$'              TERM
 
 # ============================================================================
 # Profile Migration
@@ -2058,6 +2592,12 @@ if [[ $# -ge 1 && "$1" == "bench" ]]; then
   exit $?
 fi
 
+if [[ $# -ge 1 && "$1" == "keys" ]]; then
+  shift
+  cmd_keys "$@"
+  exit $?
+fi
+
 # Top-level shortcuts: `cclm resume` and `cclm <profile-slug>`. Both must
 # short-circuit the profile/backend pickers by pre-populating preload globals.
 # Explicit backend flags (--lms/--llama/...) take precedence — if any backend
@@ -2108,6 +2648,24 @@ while (( $# )); do
   shift
 done
 export DRY_RUN
+
+# --- Per-project .cclmrc auto-selection -------------------------------------
+# Precedence: CLI flags > positional slug > .cclmrc > picker. At this point
+# both paths that set a backend have already run: an explicit `--<backend>`
+# flag will have set $backend, and a matching positional slug will have set
+# both $backend AND $_PRELOADED_PROFILE via try_shortcut_dispatch. So "nothing
+# explicit was selected" reduces to the single guard below.
+if [[ -z "$backend" && -z "${_PRELOADED_PROFILE:-}" ]]; then
+  _rcpath=$(find_cclmrc "$PWD") || _rcpath=""
+  if [[ -n "$_rcpath" ]] && apply_cclmrc "$_rcpath"; then
+    if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+      echo "[cclm] using .cclmrc from $_rcpath: profile=${_PRELOADED_PROFILE:t:r}" >&2
+    else
+      echo "[cclm] using .cclmrc from $_rcpath: backend=$backend" >&2
+    fi
+  fi
+  unset _rcpath
+fi
 
 # Load last session state (always returns 0; last_* may be empty on first run).
 load_last_session
@@ -3063,7 +3621,17 @@ run_llama() {
 
 run_zai() {
   # --- 1. API key ---
-  # ZAI_API_KEY in env > interactive prompt + persist to ~/.zshenv.
+  # Source-of-truth chain: cclm keys (keychain/secret-tool/file) > existing
+  # $ZAI_API_KEY in env > interactive prompt + persist to ~/.zshenv. The first
+  # lookup covers new users who ran `cclm keys add zai`; the env check keeps
+  # backward-compat for users whose shell already exports the key.
+  local _zai_stored
+  _zai_stored="$(_cclm_get_key zai)"
+  if [[ -n "$_zai_stored" ]]; then
+    export ZAI_API_KEY="$_zai_stored"
+  fi
+  unset _zai_stored
+
   if [[ -z "${ZAI_API_KEY:-}" ]]; then
     echo "" >&2
     echo "Z.ai API key not found in \$ZAI_API_KEY." >&2

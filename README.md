@@ -165,6 +165,28 @@ Actions:
 
 On the backend picker, if there is a recorded previous session, option `0) Resume last session` appears — selecting it re-dispatches to that backend against the previously-used remote host and model. State lives at `~/.config/cclm/.last_session`.
 
+### Per-project config (`.cclmrc`)
+
+Drop a `.cclmrc` file at the root of a project and `cclm` will auto-select a profile whenever you run it from anywhere inside that tree. Discovery walks up from `$PWD`, stopping at the first match, at `$HOME`, or at `/` — whichever comes first. `$PWD` is honored as a logical path, so `cd`'ing through a symlink works as expected.
+
+Format is one `key=value` per line; blank lines and `#` comments are ignored. Supported keys:
+
+```ini
+# Pin to a specific saved profile (highest-specificity option).
+profile=llama-qwen3
+
+# Or, pin only the backend and let the picker handle the profile.
+# backend=lms   # one of: lms | llama | zai | remote | ollama | vllm
+```
+
+**Precedence:** CLI flags (`--lms`, `--llama`, …) > positional slug (`cclm lms-qwen3`) > `.cclmrc` > interactive picker. On a successful hit, cclm prints one diagnostic line to stderr before dispatching:
+
+```
+[cclm] using .cclmrc from /path/to/project/.cclmrc: profile=llama-qwen3
+```
+
+Malformed lines, unknown backends, or a `profile=` pointing at a non-existent file each produce a stderr warning and fall through to the picker (never a hard exit). Unknown keys warn but are otherwise ignored for forward compatibility.
+
 ### Session log
 
 Every real launch (not `--dry-run`) appends one JSONL record to `~/.cache/cclm/sessions.log` with:
@@ -237,6 +259,25 @@ Each profile captures model identifiers, server parameters, and (for remote setu
 
 Example templates live in `profiles/examples/`.
 
+### Per-profile MCP servers
+
+Any profile JSON may carry an optional top-level `mcp_servers` object mapping server name to server config. When cclm loads a profile that has this field, it merges the entries into `~/.claude.json`'s `mcpServers` (after backing the original up to `~/.claude.json.cclm-backup`) so Claude Code sees exactly the MCP servers you want per profile. Same-named servers are overridden by the profile — profile wins.
+
+```json
+{
+  "model": "qwen/qwen3-coder-30b",
+  "context_length": 200000,
+  "mcp_servers": {
+    "fs":     { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/src"] },
+    "sqlite": { "command": "uvx", "args": ["mcp-server-sqlite", "--db-path", "/tmp/app.db"] }
+  }
+}
+```
+
+**Caveat — exec replaces the process.** `launch_claude` ends with `exec claude`, which replaces the cclm process with claude. That means the cclm-side EXIT trap that would roll `~/.claude.json` back never fires on a successful launch. Instead, the backup is left on disk and restored automatically at the start of the **next** cclm invocation (you'll see `cclm: restoring … from previous session backup.` on stderr). The EXIT trap only matters when cclm dies before exec — e.g. a jq failure, `--dry-run`, Ctrl-C during the merge.
+
+**Dry run.** `cclm --dry-run` (or `--print-env`) prints the JSON that *would* be written to `~/.claude.json` and exits without touching any file or spawning claude.
+
 ## Backend notes
 
 ### Z.ai (`--zai`)
@@ -251,7 +292,7 @@ Z.ai speaks the Anthropic API, so cclm routes `claude` there via `ANTHROPIC_BASE
 
 The configure step will offer "same as Opus/Sonnet" shortcuts so you don't have to type the model three times.
 
-`ZAI_API_KEY` is read from the environment. cclm will offer to save it to `~/.zshenv` on first run.
+`ZAI_API_KEY` is read from the environment. cclm will offer to save it to `~/.zshenv` on first run. For a more secure alternative, store it in your system credential store with `cclm keys add zai` — see [Credential storage](#credential-storage) below.
 
 ### Generic remote (`--remote`)
 
@@ -269,6 +310,27 @@ vLLM exposes an OpenAI-compatible API at `http://<host>:8000/v1`. cclm prompts f
 
 Use `--host <ip>` with `--lms` or `--llama` to run the backend on another machine. cclm prints a copy-pasteable one-liner to run there (binding `--host 0.0.0.0` for llama.cpp, `lms server start --port …` for LM Studio) and polls for readiness.
 
+## Credential storage
+
+`cclm keys` stores API tokens in your OS credential store so they never touch `~/.zshenv` in plaintext.
+
+```bash
+cclm keys add zai        # prompt for secret (input hidden), store in keychain
+cclm keys get zai        # print the stored secret on stdout (for scripting)
+cclm keys list           # list key names only — values are never shown
+cclm keys remove zai     # delete the stored entry
+```
+
+Backends are auto-detected in this order:
+
+1. **macOS Keychain** via `security` — entries stored under the service name `cclm-<name>`.
+2. **Linux libsecret** via `secret-tool` — attributes `service=cclm name=<name>`.
+3. **File fallback** — `~/.config/cclm/keys/<name>` with mode `0600` in a `0700` directory, when neither CLI is available. cclm prints a stderr warning so you know you're on the fallback path.
+
+When `run_zai` needs the Z.ai key it looks up (in order) `cclm keys get zai`, then the `ZAI_API_KEY` env var, then the file fallback. Existing users with `ZAI_API_KEY` in their shell continue to work with zero changes; migrating is as simple as `cclm keys add zai` and removing the `export` from your shell rc.
+
+Secrets are never logged: `add`/`remove`/`list` only print status to stderr, and only `cclm keys get` emits the value — on stdout, so pipes and command substitution work cleanly.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -276,7 +338,7 @@ Use `--host <ip>` with `--lms` or `--llama` to run the backend on another machin
 | `CCLM_MODELS_DIR` | Override the GGUF scan directory (default: `~/.cache/lm-studio/models`) |
 | `CCLM_API_TIMEOUT_MS` | Override API timeout passed to claude (default: profile value or 3000000 for remote) |
 | `CCLM_TIER_OPUS` / `_SONNET` / `_HAIKU` | Set by cclm for zai/remote backends; claude reads these via `ANTHROPIC_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` |
-| `ZAI_API_KEY` | Z.ai API token — read from env, optionally persisted to `~/.zshenv` |
+| `ZAI_API_KEY` | Z.ai API token — read from env (back-compat). Prefer `cclm keys add zai` for keychain storage |
 | `ANTHROPIC_API_KEY` | `cclm` overrides this to `lmstudio` for local sessions; don't set manually unless your backend needs it |
 | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` | Set by cclm per backend; do not set manually |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` / `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | Set by cclm to the profile's context length so claude auto-compacts at the correct boundary |
