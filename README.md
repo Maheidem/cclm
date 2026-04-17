@@ -35,6 +35,38 @@ cp bin/cclm ~/.local/bin/ && chmod +x ~/.local/bin/cclm
 mkdir -p ~/.config/cclm
 ```
 
+### Shell completion
+
+`install.sh` offers (default Yes) to install completions from `completions/`:
+
+- **zsh** — on macOS with Homebrew present, `_cclm` is copied to
+  `$(brew --prefix)/share/zsh/site-functions/`. Otherwise it goes to
+  `~/.zsh/completions/_cclm`; in that case add the dir to `$fpath` in your
+  `~/.zshrc` before `compinit`:
+
+  ```zsh
+  fpath=("$HOME/.zsh/completions" $fpath)
+  autoload -U compinit && compinit
+  ```
+
+- **bash** — copied to `$(brew --prefix)/etc/bash_completion.d/cclm`
+  (Homebrew) or `/etc/bash_completion.d/cclm` when writable, else
+  `~/.bash_completion.d/cclm`. In the last case, source it from `~/.bashrc`:
+
+  ```bash
+  [[ -r "$HOME/.bash_completion.d/cclm" ]] && source "$HOME/.bash_completion.d/cclm"
+  ```
+
+Completions cover the top-level flags (`--lms --llama --zai --remote --host=
+--resume --dry-run --print-env`), profile slugs taken from
+`~/.config/cclm/*.json`, and recently-used hosts (from
+`~/.config/cclm/.last_session`) after `--host=`. Test it manually with:
+
+```bash
+cclm <TAB>             # flags and profile slugs
+cclm --host=<TAB>      # recent hosts
+```
+
 ## Usage
 
 ```bash
@@ -43,9 +75,9 @@ cclm --lms                 # LM Studio backend directly
 cclm --llama               # llama.cpp backend directly
 cclm --zai                 # Z.ai GLM remote (tier selection)
 cclm --remote              # generic OpenAI-compatible remote
+cclm --ollama              # Ollama (OpenAI-compatible; default port 11434)
 cclm --host <ip_or_name>   # remote host for --lms / --llama
 cclm --llama --resume      # any unknown arg is passed through to claude
-cclm --dry-run             # print env + would-be command, don't exec (alias: --print-env)
 ```
 
 ### Profile picker
@@ -103,6 +135,7 @@ Profiles are plain JSON files in `~/.config/cclm/`, prefixed by backend:
 - **llama.cpp:** `llama-<slug>.json`
 - **Z.ai:** `zai-<name>.json`
 - **Remote:** `remote-<slug>.json`
+- **Ollama:** `ollama-<slug>.json`
 
 Each profile captures model identifiers, server parameters, and (for remote setups) the host address. On first run cclm offers to save your answers; on subsequent runs the values become defaults.
 
@@ -127,6 +160,10 @@ The configure step will offer "same as Opus/Sonnet" shortcuts so you don't have 
 ### Generic remote (`--remote`)
 
 Point cclm at any OpenAI-compatible endpoint. You'll be asked for `base_url`, model name per tier, `context_length`, and `api_timeout_ms`. Stored as `remote-<slug>.json`.
+
+### Ollama (`--ollama`)
+
+Ollama exposes an OpenAI-compatible API at `http://<host>:11434/v1`. cclm prompts for `host[:port]` (default `localhost:11434`), lists available models via `/v1/models` (or falls back to manual entry), then asks for `context_length`. Stored as `ollama-<slug>.json`. Start Ollama with `ollama serve` before launching.
 
 ### LM Studio / llama.cpp remote
 

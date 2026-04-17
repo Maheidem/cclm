@@ -1,0 +1,53 @@
+#compdef cclm
+# zsh completion for cclm.
+#
+# Install: place this file in a directory on $fpath (e.g.
+#   ~/.zsh/completions/ or $(brew --prefix)/share/zsh/site-functions/) and
+# ensure `autoload -U compinit && compinit` runs in ~/.zshrc.
+#
+# This file defines the `_cclm` function (and two helpers). When loaded via
+# compinit's autoload mechanism the function is registered as the completion
+# for `cclm`. Sourcing this file directly (as the smoke test does) just
+# defines the functions without invoking them.
+
+# Helper: emit profile slugs found under $HOME/.config/cclm.
+# Strips the .json suffix so `lms-qwen3.json` completes as `lms-qwen3`.
+# Uses (N) nullglob so an empty config dir doesn't yield a literal pattern.
+_cclm_profiles() {
+  local config_dir="${CCLM_CONFIG_DIR:-$HOME/.config/cclm}"
+  local -a profiles
+  local f
+  for f in "$config_dir"/*.json(N); do
+    profiles+=("${${f:t}%.json}")
+  done
+  (( ${#profiles} )) && compadd -a profiles
+}
+
+# Helper: recent hosts from last-session state (single value today; list-safe).
+_cclm_hosts() {
+  local state="${CCLM_CONFIG_DIR:-$HOME/.config/cclm}/.last_session"
+  local -a hosts
+  local h
+  if [[ -r "$state" ]] && (( $+commands[jq] )); then
+    h=$(jq -r '.remote_host // empty' "$state" 2>/dev/null)
+    [[ -n "$h" ]] && hosts+=("$h")
+  fi
+  (( ${#hosts} )) && compadd -a hosts
+}
+
+_cclm() {
+  local curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  _arguments -C \
+    '(--llama --zai --remote)--lms[use LM Studio backend]' \
+    '(--lms --zai --remote)--llama[use llama.cpp backend]' \
+    '(--lms --llama --remote)--zai[use Z.ai GLM remote backend]' \
+    '(--lms --llama --zai)--remote[use generic OpenAI-compatible remote]' \
+    '--host=[remote host for local backends]:host:_cclm_hosts' \
+    '--host[remote host for local backends]:host:_cclm_hosts' \
+    '--resume[resume previous claude session]' \
+    '--dry-run[print actions without launching claude]' \
+    '--print-env[print resolved environment and exit]' \
+    '*:profile:_cclm_profiles'
+}

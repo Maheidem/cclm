@@ -8,6 +8,19 @@ BIN_SRC="$REPO_DIR/bin/cclm"
 BIN_DST_DIR="$HOME/.local/bin"
 BIN_DST="$BIN_DST_DIR/cclm"
 CONFIG_DIR="$HOME/.config/cclm"
+ZSH_COMP_SRC="$REPO_DIR/completions/_cclm"
+BASH_COMP_SRC="$REPO_DIR/completions/cclm.bash"
+
+# ask_yes_default <prompt>  →  returns 0 (yes) by default, 1 on explicit no.
+# FORCE=1 skips the prompt and answers yes.
+ask_yes_default() {
+  local prompt="$1" ans
+  if [[ "${FORCE:-0}" == "1" ]]; then
+    return 0
+  fi
+  read -r -p "$prompt (Y/n): " ans || return 1
+  [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]
+}
 
 echo "=== cclm installer ==="
 echo
@@ -49,6 +62,62 @@ fi
 # ── Config dir ───────────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
 echo "Config dir: $CONFIG_DIR"
+
+# ── Shell completions ────────────────────────────────────────────────────────
+# zsh
+if [[ -f "$ZSH_COMP_SRC" ]]; then
+  echo
+  zsh_dst=""
+  zsh_hint=""
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+    if [[ -n "$brew_prefix" && -d "$brew_prefix/share/zsh/site-functions" ]]; then
+      zsh_dst="$brew_prefix/share/zsh/site-functions/_cclm"
+    fi
+  fi
+  if [[ -z "$zsh_dst" ]]; then
+    zsh_dst="$HOME/.zsh/completions/_cclm"
+    zsh_hint="Add this to your ~/.zshrc (before 'compinit'):
+  fpath=(\"\$HOME/.zsh/completions\" \$fpath)"
+  fi
+  if ask_yes_default "Install zsh completion to $zsh_dst?"; then
+    mkdir -p "$(dirname "$zsh_dst")"
+    cp "$ZSH_COMP_SRC" "$zsh_dst"
+    echo "Installed: $zsh_dst"
+    [[ -n "$zsh_hint" ]] && echo "$zsh_hint"
+  else
+    echo "Skipped zsh completion."
+  fi
+fi
+
+# bash
+if [[ -f "$BASH_COMP_SRC" ]]; then
+  echo
+  bash_dst=""
+  bash_hint=""
+  if command -v brew >/dev/null 2>&1; then
+    brew_prefix="${brew_prefix:-$(brew --prefix 2>/dev/null || true)}"
+    if [[ -n "$brew_prefix" && -d "$brew_prefix/etc/bash_completion.d" ]]; then
+      bash_dst="$brew_prefix/etc/bash_completion.d/cclm"
+    fi
+  fi
+  if [[ -z "$bash_dst" && -d "/etc/bash_completion.d" && -w "/etc/bash_completion.d" ]]; then
+    bash_dst="/etc/bash_completion.d/cclm"
+  fi
+  if [[ -z "$bash_dst" ]]; then
+    bash_dst="$HOME/.bash_completion.d/cclm"
+    bash_hint="Add this to your ~/.bashrc:
+  [[ -r \"\$HOME/.bash_completion.d/cclm\" ]] && source \"\$HOME/.bash_completion.d/cclm\""
+  fi
+  if ask_yes_default "Install bash completion to $bash_dst?"; then
+    mkdir -p "$(dirname "$bash_dst")"
+    cp "$BASH_COMP_SRC" "$bash_dst"
+    echo "Installed: $bash_dst"
+    [[ -n "$bash_hint" ]] && echo "$bash_hint"
+  else
+    echo "Skipped bash completion."
+  fi
+fi
 
 # ── PATH hint ────────────────────────────────────────────────────────────────
 case ":$PATH:" in
