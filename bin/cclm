@@ -1358,6 +1358,641 @@ EOF
   return 0
 }
 
+# ============================================================================
+# `cclm bench` subcommand
+# ============================================================================
+# Benchmark OpenAI-compatible backends by POSTing a short prompt to
+# /v1/chat/completions and measuring wallclock + token counts.
+#
+#   cclm bench                               — bench every saved profile (except zai)
+#   cclm bench --profiles lms-foo,llama-bar  — bench specific profiles (comma-sep)
+#   cclm bench --iterations 3                — repeat N times, show individual rows + mean
+#   cclm bench --prompt-file PATH            — use a custom prompt file (<=~50 tokens)
+#   cclm bench --dry-run                     — print curl commands, don't run them
+#
+# Output: markdown-style table to stdout. Progress/warnings go to stderr so the
+# table is clean under `cclm bench | tee bench.md`.
+#
+# zai-*.json profiles are skipped: Z.ai speaks the Anthropic-native messages
+# protocol (/v1/messages), not OpenAI /v1/chat/completions, and wiring up the
+# different request/response shape is out of scope for this first pass.
+#
+# Auth: no Authorization header is sent by default. Local backends (lms / llama
+# / ollama / vllm) accept unauthenticated requests on localhost; for remote
+# profiles that need a key, set CCLM_BENCH_API_KEY in the environment and it
+# will be sent as `Authorization: Bearer <key>`.
+#
+# Wallclock: zmodload zsh/datetime gives us $EPOCHREALTIME (float seconds,
+# cross-platform, no subprocess — `date +%s.%N` is GNU-only and `date +%s` has
+# 1s granularity, both useless for fast backends).
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+
+# Resolve a saved profile JSON path into (base_url, model_id) suitable for
+# POSTing to /v1/chat/completions. Prints `base_url|model_id|display_label` to
+# stdout; returns 1 if the profile is unsupported (zai) or malformed.
+# `display_label` is the profile slug (no prefix) used for table rows.
+_cclm_bench_resolve() {
+  # NOTE: zsh ties lowercase `path` to the `PATH` array — `local path=...`
+  # would blow away PATH inside the function and hide jq/curl. Use `pfile`.
+  local pfile="$1"
+  local base="${pfile:t}"           # basename
+  base="${base%.json}"
+  local prefix="${base%%-*}"        # lms / llama / zai / ...
+  # display label is the full slug (e.g. "lms-qwen3"); keeps rows unambiguous
+  # when two backends have the same short name.
+  local slug="$base"
+
+  local host port model url
+  case "$prefix" in
+    zai)
+      echo "[bench] skipping $base — Z.ai speaks Anthropic-native protocol" >&2
+      return 1
+      ;;
+    lms)
+      host=$(jq -r '.remote_host // "localhost"' "$pfile")
+      [[ -z "$host" || "$host" == "null" ]] && host="localhost"
+      port="1234"
+      model=$(jq -r '.model // ""' "$pfile")
+      ;;
+    llama)
+      host=$(jq -r '.remote_host // "localhost"' "$pfile")
+      [[ -z "$host" || "$host" == "null" ]] && host="localhost"
+      port=$(jq -r '.port // "8081"' "$pfile")
+      # llama profiles store the full .gguf path; llama-server accepts any
+      # identifier in the request body, so the basename (no extension) is a
+      # reasonable display-and-payload choice.
+      model=$(jq -r '.model_path // ""' "$pfile")
+      model="${model:t}"
+      model="${model%.gguf}"
+      ;;
+    remote|ollama|vllm)
+      host=$(jq -r '.host // ""' "$pfile")
+      port=$(jq -r --arg p "$prefix" '.port // (if $p == "ollama" then "11434" elif $p == "vllm" then "8000" else "1234" end)' "$pfile")
+      model=$(jq -r '.model // ""' "$pfile")
+      ;;
+    *)
+      echo "[bench] skipping $base — unknown backend prefix" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ -z "$host" || -z "$model" ]]; then
+    echo "[bench] skipping $base — missing host or model" >&2
+    return 1
+  fi
+  url="http://${host}:${port}"
+  printf '%s|%s|%s\n' "$url" "$model" "$slug"
+  return 0
+}
+
+# Run one /v1/chat/completions POST. Returns 0 and prints
+# "<wallclock>|<prompt_tok>|<completion_tok>|<tok_per_s>" on stdout. On
+# failure, returns non-zero and prints a short reason on stderr.
+_cclm_bench_one_iter() {
+  local base_url="$1" model="$2" prompt="$3"
+
+  local payload
+  payload=$(jq -n \
+    --arg m "$model" \
+    --arg p "$prompt" \
+    '{model: $m, messages: [{role: "user", content: $p}], max_tokens: 200, stream: false}')
+
+  # Optional bearer auth (remote backends may require it).
+  local -a auth_args=()
+  if [[ -n "${CCLM_BENCH_API_KEY:-}" ]]; then
+    auth_args=(-H "Authorization: Bearer ${CCLM_BENCH_API_KEY}")
+  fi
+
+  local t0 t1 elapsed
+  t0="$EPOCHREALTIME"
+  local resp rc=0
+  # curl failure must not trip `set -e` — we want to report it, not die.
+  resp=$(curl -sS --max-time 120 \
+    -H "Content-Type: application/json" \
+    "${auth_args[@]}" \
+    -d "$payload" \
+    "${base_url}/v1/chat/completions" 2>/dev/null) || rc=$?
+  t1="$EPOCHREALTIME"
+
+  if (( rc != 0 )) || [[ -z "$resp" ]]; then
+    echo "[bench] curl failed against ${base_url} (rc=${rc})" >&2
+    return 1
+  fi
+
+  # jq under `set -o pipefail`: if the body isn't JSON, the whole thing should
+  # fail gracefully. We parse fields individually and default to "" so a
+  # partial response surfaces as an obvious bad row rather than crashing.
+  local pt ct
+  pt=$(echo "$resp" | jq -r '.usage.prompt_tokens // empty' 2>/dev/null)
+  ct=$(echo "$resp" | jq -r '.usage.completion_tokens // empty' 2>/dev/null)
+  if [[ -z "$pt" || -z "$ct" ]]; then
+    echo "[bench] malformed response from ${base_url} (no usage fields)" >&2
+    return 1
+  fi
+
+  # LC_ALL=C forces awk to use '.' as decimal separator regardless of locale —
+  # users with comma-decimal locales (de_DE.UTF-8 etc.) would otherwise get
+  # "0,210" which breaks downstream markdown parsing.
+  elapsed=$(LC_ALL=C awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.3f", a - b}')
+  local tps
+  tps=$(LC_ALL=C awk -v c="$ct" -v e="$elapsed" 'BEGIN{ if (e+0 <= 0) printf "inf"; else printf "%.2f", c / e }')
+  printf '%s|%s|%s|%s\n' "$elapsed" "$pt" "$ct" "$tps"
+  return 0
+}
+
+cmd_bench() {
+  # --- arg parse ---
+  local prompt_file="" iterations=1 profiles_spec=""
+  local dry_run=false
+  while (( $# )); do
+    case "$1" in
+      --prompt-file)
+        [[ $# -ge 2 ]] || { echo "--prompt-file requires an argument" >&2; return 2; }
+        prompt_file="$2"; shift ;;
+      --prompt-file=*) prompt_file="${1#--prompt-file=}" ;;
+      --profiles)
+        [[ $# -ge 2 ]] || { echo "--profiles requires an argument" >&2; return 2; }
+        profiles_spec="$2"; shift ;;
+      --profiles=*) profiles_spec="${1#--profiles=}" ;;
+      --iterations)
+        [[ $# -ge 2 ]] || { echo "--iterations requires an argument" >&2; return 2; }
+        iterations="$2"; shift ;;
+      --iterations=*) iterations="${1#--iterations=}" ;;
+      --dry-run) dry_run=true ;;
+      -h|--help)
+        cat >&2 <<'EOF'
+Usage: cclm bench [--prompt-file FILE] [--profiles <slugs>] [--iterations N] [--dry-run]
+
+Benchmark OpenAI-compatible backends by POSTing a short prompt to
+/v1/chat/completions and measuring wallclock and tokens/sec.
+
+Options:
+  --prompt-file FILE      Prompt text file (default: short embedded haiku prompt)
+  --profiles <slugs>      Comma-separated list of profile slugs (default: all saved, except zai)
+  --iterations N          Repeat N times per profile, print individual rows + mean (default: 1)
+  --dry-run               Print the curl commands that would run and exit
+
+Env:
+  CCLM_BENCH_API_KEY      Optional bearer token sent as Authorization header.
+
+Z.ai profiles (zai-*.json) are skipped — Anthropic-native protocol is out of
+scope for this first pass.
+EOF
+        return 0 ;;
+      *) echo "Unknown option: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  if ! [[ "$iterations" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--iterations must be a positive integer" >&2
+    return 2
+  fi
+
+  # --- resolve prompt ---
+  local prompt
+  if [[ -n "$prompt_file" ]]; then
+    if [[ ! -f "$prompt_file" ]]; then
+      echo "cclm bench: prompt file not found: $prompt_file" >&2
+      return 1
+    fi
+    prompt=$(<"$prompt_file")
+  else
+    prompt="Write a haiku about idempotent installers."
+  fi
+
+  # --- resolve profile list ---
+  local -a profile_paths
+  local _slug _path
+  if [[ -n "$profiles_spec" ]]; then
+    for _slug in ${(s:,:)profiles_spec}; do
+      [[ -z "$_slug" ]] && continue
+      _path="$CONFIG_DIR/${_slug}.json"
+      if [[ ! -f "$_path" ]]; then
+        echo "[bench] warning: profile not found: $_path" >&2
+        continue
+      fi
+      profile_paths+=("$_path")
+    done
+  else
+    # Include zai-*.json in the default sweep so the user sees an explicit
+    # skip message (instead of silently missing profiles). Resolver filters them.
+    profile_paths=( "$CONFIG_DIR"/{lms,llama,zai,remote,ollama,vllm}-*.json(N) )
+  fi
+
+  if (( ${#profile_paths[@]} == 0 )); then
+    echo "cclm bench: no benchable profiles found." >&2
+    return 1
+  fi
+
+  # --- zsh datetime for sub-second wallclock ---
+  zmodload zsh/datetime 2>/dev/null || {
+    echo "cclm bench: zsh/datetime module unavailable" >&2
+    return 1
+  }
+
+  # Declare loop-local scratch vars once for the whole function body. Re-
+  # declaring `local p` / `local slug` later (e.g. in the live loop) would
+  # trigger zsh's typeset-echoing-its-value-to-stdout behavior when the name
+  # already exists in the same scope. One declaration, reused in both blocks.
+  local p_iter resolved base_url model slug_out i
+
+  # --- dry-run: print curl commands, exit 0 ---
+  if $dry_run; then
+    for p_iter in "${profile_paths[@]}"; do
+      resolved=$(_cclm_bench_resolve "$p_iter") || continue
+      IFS='|' read -r base_url model slug_out <<< "$resolved"
+      for (( i=1; i<=iterations; i++ )); do
+        printf 'curl -sS -H "Content-Type: application/json" -d %q %s/v1/chat/completions  # [%s iter %d]\n' \
+          "$(jq -n --arg m "$model" --arg pr "$prompt" '{model:$m, messages:[{role:"user",content:$pr}], max_tokens:200, stream:false}')" \
+          "$base_url" "$slug_out" "$i"
+      done
+    done
+    return 0
+  fi
+
+  # --- header ---
+  local header_iter=""
+  (( iterations > 1 )) && header_iter="| iter "
+  printf '| profile                              %s| wallclock (s) | prompt_tok | completion_tok | tok/s |\n' "$header_iter"
+  printf '|--------------------------------------'
+  (( iterations > 1 )) && printf -- '|------'
+  printf '|---------------|------------|----------------|-------|\n'
+
+  local success_count=0 fail_count=0
+  local -a wall_times completion_tokens_arr
+  local one rc wall pt ct tps mean_wall mean_tps total_ct ct_i iter_fail
+  for p_iter in "${profile_paths[@]}"; do
+    resolved=$(_cclm_bench_resolve "$p_iter") || { fail_count=$((fail_count + 1)); continue; }
+    IFS='|' read -r base_url model slug_out <<< "$resolved"
+    echo "[bench] ${slug_out} -> ${base_url} (${model})" >&2
+
+    wall_times=()
+    completion_tokens_arr=()
+    iter_fail=false
+
+    for (( i=1; i<=iterations; i++ )); do
+      rc=0
+      one=$(_cclm_bench_one_iter "$base_url" "$model" "$prompt") || rc=$?
+      if (( rc != 0 )); then
+        iter_fail=true
+        if (( iterations > 1 )); then
+          printf '| %-36s | %-4d | %13s | %10s | %14s | %5s |\n' "$slug_out" "$i" "ERR" "-" "-" "-"
+        else
+          printf '| %-36s | %13s | %10s | %14s | %5s |\n' "$slug_out" "ERR" "-" "-" "-"
+        fi
+        continue
+      fi
+      IFS='|' read -r wall pt ct tps <<< "$one"
+      wall_times+=("$wall")
+      completion_tokens_arr+=("$ct")
+      if (( iterations > 1 )); then
+        printf '| %-36s | %-4d | %13s | %10s | %14s | %5s |\n' "$slug_out" "$i" "$wall" "$pt" "$ct" "$tps"
+      else
+        printf '| %-36s | %13s | %10s | %14s | %5s |\n' "$slug_out" "$wall" "$pt" "$ct" "$tps"
+      fi
+    done
+
+    if (( ${#wall_times[@]} > 0 )); then
+      success_count=$((success_count + 1))
+      if (( iterations > 1 )); then
+        # mean row
+        mean_wall=$(printf '%s\n' "${wall_times[@]}" | LC_ALL=C awk '{s+=$1; n++} END{if(n>0) printf "%.3f", s/n}')
+        total_ct=0
+        for ct_i in "${completion_tokens_arr[@]}"; do total_ct=$((total_ct + ct_i)); done
+        mean_tps=$(LC_ALL=C awk -v c="$total_ct" -v w="$mean_wall" -v n="${#wall_times[@]}" \
+          'BEGIN{ if (w+0 <= 0) printf "inf"; else printf "%.2f", (c/n) / w }')
+        printf '| %-36s | %-4s | %13s | %10s | %14s | %5s |\n' "$slug_out" "mean" "$mean_wall" "-" "-" "$mean_tps"
+      fi
+    else
+      fail_count=$((fail_count + 1))
+    fi
+  done
+
+  echo "[bench] ${success_count} succeeded, ${fail_count} failed" >&2
+  (( success_count > 0 )) || return 1
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Profile management (`cclm profile <subcmd>`)
+#
+# Subcommands: list | clone <src> <dst> | rename <old> <new> | delete <slug>
+#
+# Slug validation: a slug must start with a valid backend prefix
+# (lms-/llama-/zai-/remote-/ollama-/vllm-) followed by a non-empty name. Clone
+# and rename additionally require src and dst to share the same backend prefix
+# — moving a profile across backends would create a file whose JSON schema
+# mismatches its filename, i.e. an unusable profile.
+#
+# Atomicity:
+#   clone  — cp src tmp (same dir) && mv tmp dst (rename, atomic on same FS)
+#   rename — mv src dst (atomic on same FS)
+#   delete — rm (atomic)
+# Refuse-on-overwrite: clone/rename exit 1 if dst already exists.
+#
+# Defined above the CCLM_LIB_ONLY guard so unit tests can call it directly.
+# ----------------------------------------------------------------------------
+
+_cclm_valid_prefix() {
+  local prefix="$1"
+  case "$prefix" in
+    lms|llama|zai|remote|ollama|vllm) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_profile() {
+  local sub="${1:-}"
+  if [[ -z "$sub" ]]; then
+    cat >&2 <<'EOF'
+Usage: cclm profile <subcommand> [args...]
+
+Subcommands:
+  list                        List saved profiles grouped by backend.
+  clone <src> <dst>           Copy profile <src> to <dst> (same backend prefix).
+  rename <old> <new>          Rename profile <old> to <new> (same backend prefix).
+  delete <slug>               Delete profile <slug> (prompts unless FORCE=1).
+EOF
+    return 2
+  fi
+  shift
+
+  case "$sub" in
+    list)   _cclm_profile_list "$@" ;;
+    clone)  _cclm_profile_clone "$@" ;;
+    rename) _cclm_profile_rename "$@" ;;
+    delete|rm) _cclm_profile_delete "$@" ;;
+    *)
+      echo "cclm profile: unknown subcommand '$sub' (expected list/clone/rename/delete)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# List saved profiles grouped by backend. Mirrors the cmd_status section but
+# as a standalone command without last-session/reachability noise.
+_cclm_profile_list() {
+  local -a all_profiles
+  all_profiles=( "$CONFIG_DIR"/{lms,llama,zai,remote,ollama,vllm}-*.json(N) )
+  if (( ${#all_profiles[@]} == 0 )); then
+    echo "No profiles saved in $CONFIG_DIR." >&2
+    return 0
+  fi
+  local be f base slug count
+  local -a group
+  for be in lms llama zai remote ollama vllm; do
+    group=( "$CONFIG_DIR"/${be}-*.json(N) )
+    count=${#group[@]}
+    (( count == 0 )) && continue
+    printf "  [%s] (%d)\n" "$be" "$count"
+    for f in "${group[@]}"; do
+      base="${f:t}"
+      slug="${base%.json}"
+      printf "    - %s\n" "$slug"
+    done
+  done
+  return 0
+}
+
+# Validate a slug's backend prefix. Writes the prefix to stdout on success.
+# On failure writes an error to stderr and returns 1.
+_cclm_profile_prefix_of() {
+  local slug="$1" label="$2"
+  if [[ -z "$slug" ]]; then
+    echo "cclm profile $label: slug required" >&2
+    return 1
+  fi
+  # Reject bare slugs with no prefix separator or an empty tail.
+  if [[ "$slug" != *-* || "${slug#*-}" == "" ]]; then
+    echo "cclm profile $label: '$slug' missing backend prefix (expected lms-/llama-/zai-/remote-/ollama-/vllm-)" >&2
+    return 1
+  fi
+  local prefix="${slug%%-*}"
+  if ! _cclm_valid_prefix "$prefix"; then
+    echo "cclm profile $label: unknown backend prefix '$prefix' (expected lms/llama/zai/remote/ollama/vllm)" >&2
+    return 1
+  fi
+  echo "$prefix"
+  return 0
+}
+
+_cclm_profile_clone() {
+  local src="${1:-}" dst="${2:-}"
+  if [[ -z "$src" || -z "$dst" ]]; then
+    echo "Usage: cclm profile clone <src-slug> <dst-slug>" >&2
+    return 2
+  fi
+
+  local src_prefix dst_prefix
+  src_prefix=$(_cclm_profile_prefix_of "$src" "clone") || return 1
+  dst_prefix=$(_cclm_profile_prefix_of "$dst" "clone") || return 1
+
+  if [[ "$src_prefix" != "$dst_prefix" ]]; then
+    echo "cclm profile clone: src/dst prefix mismatch ('$src_prefix' vs '$dst_prefix') — cross-backend clone is not allowed" >&2
+    return 1
+  fi
+
+  local src_path="$CONFIG_DIR/${src}.json"
+  local dst_path="$CONFIG_DIR/${dst}.json"
+
+  if [[ ! -f "$src_path" ]]; then
+    echo "cclm profile clone: source profile not found: $src_path" >&2
+    return 1
+  fi
+  if [[ -e "$dst_path" ]]; then
+    echo "cclm profile clone: destination already exists: $dst_path (refusing to overwrite)" >&2
+    return 1
+  fi
+
+  # Atomic copy: write to a tmp file in the same dir, then rename into place.
+  local tmp
+  tmp=$(mktemp "$CONFIG_DIR/.clone.XXXXXX") || {
+    echo "cclm profile clone: could not create tmp file in $CONFIG_DIR" >&2
+    return 1
+  }
+  if ! cp "$src_path" "$tmp"; then
+    rm -f "$tmp"
+    echo "cclm profile clone: failed to copy $src_path" >&2
+    return 1
+  fi
+  if ! mv "$tmp" "$dst_path"; then
+    rm -f "$tmp"
+    echo "cclm profile clone: failed to finalize $dst_path" >&2
+    return 1
+  fi
+  echo "Cloned ${src}.json -> ${dst}.json" >&2
+  return 0
+}
+
+_cclm_profile_rename() {
+  local old="${1:-}" new="${2:-}"
+  if [[ -z "$old" || -z "$new" ]]; then
+    echo "Usage: cclm profile rename <old-slug> <new-slug>" >&2
+    return 2
+  fi
+
+  local old_prefix new_prefix
+  old_prefix=$(_cclm_profile_prefix_of "$old" "rename") || return 1
+  new_prefix=$(_cclm_profile_prefix_of "$new" "rename") || return 1
+
+  if [[ "$old_prefix" != "$new_prefix" ]]; then
+    echo "cclm profile rename: old/new prefix mismatch ('$old_prefix' vs '$new_prefix') — cross-backend rename is not allowed" >&2
+    return 1
+  fi
+
+  local old_path="$CONFIG_DIR/${old}.json"
+  local new_path="$CONFIG_DIR/${new}.json"
+
+  if [[ ! -f "$old_path" ]]; then
+    echo "cclm profile rename: source profile not found: $old_path" >&2
+    return 1
+  fi
+  if [[ -e "$new_path" ]]; then
+    echo "cclm profile rename: destination already exists: $new_path (refusing to overwrite)" >&2
+    return 1
+  fi
+
+  if ! mv "$old_path" "$new_path"; then
+    echo "cclm profile rename: mv failed ($old_path -> $new_path)" >&2
+    return 1
+  fi
+  echo "Renamed ${old}.json -> ${new}.json" >&2
+  return 0
+}
+
+_cclm_profile_delete() {
+  local slug="${1:-}"
+  if [[ -z "$slug" ]]; then
+    echo "Usage: cclm profile delete <slug>" >&2
+    return 2
+  fi
+
+  local prefix
+  prefix=$(_cclm_profile_prefix_of "$slug" "delete") || return 1
+
+  local pfile="$CONFIG_DIR/${slug}.json"
+  if [[ ! -f "$pfile" ]]; then
+    echo "cclm profile delete: profile not found: $pfile" >&2
+    return 1
+  fi
+
+  if [[ "${FORCE:-0}" != "1" ]]; then
+    printf "Delete %s? (y/N): " "$slug" >&2
+    local reply
+    read -r reply
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+      echo "Cancelled." >&2
+      return 0
+    fi
+  fi
+
+  if ! rm -- "$pfile"; then
+    echo "cclm profile delete: rm failed: $pfile" >&2
+    return 1
+  fi
+  echo "Deleted ${slug}.json" >&2
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# LM Studio: detect currently-loaded model and render the picker.
+# Defined above the CCLM_LIB_ONLY guard so tests can drive them directly
+# without going through the full run_lms() flow (which requires a live
+# LM Studio server + matching `lms ls` output).
+# ---------------------------------------------------------------------------
+
+# Detect the currently-loaded LM Studio model.
+# Writes two tab-separated values to stdout:
+#   <modelKey>\t<identifier-preferred key>
+# Both are empty if `lms ps` fails or returns no entries — callers treat that
+# as "nothing loaded" and behavior is identical to pre-change.
+#
+# modelKey — matches entries returned by `lms ls --llm --json`; used for the
+#   existing [LOADED] marker in the picker list.
+# identifier-preferred key — falls back to modelKey when no custom identifier
+#   is set; mirrors the extraction pattern already used when resolving the
+#   API id post-load (see api_id resolution further down in run_lms).
+_cclm_lms_detect_loaded() {
+  local ps_json mk ident
+  ps_json=$(lms ps --json 2>/dev/null || true)
+  if [[ -z "$ps_json" ]]; then
+    printf '\t\n'
+    return 0
+  fi
+  mk=$(printf '%s' "$ps_json" | jq -r '.[0].modelKey // empty' 2>/dev/null || true)
+  ident=$(printf '%s' "$ps_json" | jq -r '.[0] | if .identifier == null or .identifier == "null" or .identifier == "" then (.modelKey // empty) else .identifier end' 2>/dev/null || true)
+  [[ "$mk" == "null" ]] && mk=""
+  [[ "$ident" == "null" ]] && ident=""
+  printf '%s\t%s\n' "$mk" "$ident"
+}
+
+# Render the interactive LM Studio model picker to stderr.
+# Args: <models_json> <loaded_id> <loaded_key>
+#   models_json — raw output of `lms ls --llm --json`
+#   loaded_id   — modelKey of loaded model (empty if none)
+#   loaded_key  — identifier-preferred key (empty if none)
+#
+# Writes one tab-separated line to stdout: <default_idx>\t<show_synthetic>\t<count>
+# (default_idx=0 when no default should be offered; show_synthetic is
+# "true"/"false"; count is the number of numbered entries.)
+#
+# Rendering rules (req 2):
+#   - [LOADED] marker on list entry whose modelKey == loaded_id.
+#   - Loaded model's slug-profile EXISTS → default_idx = its list position;
+#     prompt shows "[N]" hint so Enter picks it.
+#   - Loaded model exists but has NO saved profile → prepend synthetic
+#     "0) Use currently-loaded model: <loaded_key>" and allow 0 in range.
+_cclm_lms_render_model_picker() {
+  local models_json="$1" loaded_id="$2" loaded_key="$3"
+  local count default_idx=0 show_synthetic=false has_loaded_profile=false
+  count=$(printf '%s' "$models_json" | jq 'length' 2>/dev/null || echo 0)
+
+  if [[ -n "$loaded_key" ]] && [[ -f "$CONFIG_DIR/lms-$(slug "$loaded_key").json" ]]; then
+    has_loaded_profile=true
+  fi
+
+  echo "" >&2
+  echo "Available LM Studio models:" >&2
+  echo "" >&2
+
+  if [[ -n "$loaded_key" ]] && ! $has_loaded_profile; then
+    show_synthetic=true
+    printf "  0) Use currently-loaded model: %s\n" "$loaded_key" >&2
+  fi
+
+  local i key display params max_ctx tool_use loaded_marker tool_tag saved_tag
+  for ((i=0; i<count; i++)); do
+    loaded_marker="" tool_tag="" saved_tag=""
+    key=$(printf '%s' "$models_json" | jq -r ".[$i].modelKey")
+    display=$(printf '%s' "$models_json" | jq -r ".[$i].displayName")
+    params=$(printf '%s' "$models_json" | jq -r ".[$i].paramsString")
+    max_ctx=$(printf '%s' "$models_json" | jq -r ".[$i].maxContextLength")
+    tool_use=$(printf '%s' "$models_json" | jq -r ".[$i].trainedForToolUse")
+    [[ "$key" = "$loaded_id" ]] && loaded_marker=" [LOADED]"
+    [[ "$tool_use" = "true" ]] && tool_tag=" tools"
+    [[ -f "$CONFIG_DIR/lms-$(slug "$key").json" ]] && saved_tag=" *"
+    if $has_loaded_profile && [[ "$key" = "$loaded_id" ]]; then
+      default_idx=$((i+1))
+    fi
+    printf "  %d) %-30s %6s  ctx:%dk%s%s%s\n" \
+      $((i+1)) "$display" "$params" $((max_ctx/1024)) "$tool_tag" "$loaded_marker" "$saved_tag" >&2
+  done
+  echo "" >&2
+  echo "  (* = saved profile)" >&2
+  echo "" >&2
+
+  local prompt_range="1-${count}"
+  $show_synthetic && prompt_range="0-${count}"
+  if (( default_idx > 0 )); then
+    printf "Select model (%s) [%d]: " "$prompt_range" "$default_idx" >&2
+  else
+    printf "Select model (%s): " "$prompt_range" >&2
+  fi
+
+  printf '%d\t%s\t%d\n' "$default_idx" "$show_synthetic" "$count"
+}
+
 # When sourced for tests (CCLM_LIB_ONLY=1), return here — helpers are defined,
 # main execution (migration, arg parsing, backend dispatch) is skipped.
 [[ "${CCLM_LIB_ONLY:-0}" == "1" ]] && return 0
@@ -1408,6 +2043,18 @@ fi
 if [[ $# -ge 1 && "$1" == "edit" ]]; then
   shift
   cmd_edit "$@"
+  exit $?
+fi
+
+if [[ $# -ge 1 && "$1" == "profile" ]]; then
+  shift
+  cmd_profile "$@"
+  exit $?
+fi
+
+if [[ $# -ge 1 && "$1" == "bench" ]]; then
+  shift
+  cmd_bench "$@"
   exit $?
 fi
 
@@ -1749,8 +2396,15 @@ run_lms() {
     exit 1
   fi
 
-  local loaded_id
-  loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty' 2>/dev/null || true)
+  # Auto-detect currently-loaded model. Empty values → nothing loaded,
+  # behavior matches pre-change (no synthetic option, no default hint).
+  local loaded_id loaded_key _detect_out
+  _detect_out=$(_cclm_lms_detect_loaded)
+  loaded_id="${_detect_out%%$'\t'*}"
+  loaded_key="${_detect_out##*$'\t'}"
+  loaded_key="${loaded_key%$'\n'}"
+  local loaded_profile_path=""
+  [[ -n "$loaded_key" ]] && loaded_profile_path="$CONFIG_DIR/lms-$(slug "$loaded_key").json"
 
   local chosen chosen_max_ctx profile
   if [[ "${EDIT_MODE:-false}" == "true" ]]; then
@@ -1761,40 +2415,47 @@ run_lms() {
     echo "" >&2
     echo "Editing profile for: $chosen" >&2
   else
-    echo "" >&2
-    echo "Available LM Studio models:" >&2
-    echo "" >&2
-    local count
-    count=$(echo "$models_json" | jq 'length')
-    local key display params max_ctx tool_use loaded_marker tool_tag saved_tag
-    for ((i=0; i<count; i++)); do
-      loaded_marker="" tool_tag="" saved_tag=""
-      key=$(echo "$models_json" | jq -r ".[$i].modelKey")
-      display=$(echo "$models_json" | jq -r ".[$i].displayName")
-      params=$(echo "$models_json" | jq -r ".[$i].paramsString")
-      max_ctx=$(echo "$models_json" | jq -r ".[$i].maxContextLength")
-      tool_use=$(echo "$models_json" | jq -r ".[$i].trainedForToolUse")
-      [[ "$key" = "$loaded_id" ]] && loaded_marker=" [LOADED]"
-      [[ "$tool_use" = "true" ]] && tool_tag=" tools"
-      [[ -f "$CONFIG_DIR/lms-$(slug "$key").json" ]] && saved_tag=" *"
-      printf "  %d) %-30s %6s  ctx:%dk%s%s%s\n" \
-        $((i+1)) "$display" "$params" $((max_ctx/1024)) "$tool_tag" "$loaded_marker" "$saved_tag" >&2
-    done
-    echo "" >&2
-    echo "  (* = saved profile)" >&2
-    echo "" >&2
+    local _picker_out default_idx show_synthetic count
+    _picker_out=$(_cclm_lms_render_model_picker "$models_json" "$loaded_id" "$loaded_key")
+    default_idx="${_picker_out%%$'\t'*}"
+    local _rest="${_picker_out#*$'\t'}"
+    show_synthetic="${_rest%%$'\t'*}"
+    count="${_rest##*$'\t'}"
+    count="${count%$'\n'}"
 
-    printf "Select model (1-%d): " "$count" >&2
     read -r selection
 
-    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
+    # Empty input → default (only valid when default_idx set).
+    if [[ -z "$selection" ]]; then
+      if (( default_idx > 0 )); then
+        selection="$default_idx"
+      else
+        echo "Invalid selection." >&2
+        exit 1
+      fi
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 0 || selection > count )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+    if (( selection == 0 )) && [[ "$show_synthetic" != "true" ]]; then
       echo "Invalid selection." >&2
       exit 1
     fi
 
-    chosen=$(echo "$models_json" | jq -r ".[$((selection-1))].modelKey")
-    chosen_max_ctx=$(echo "$models_json" | jq -r ".[$((selection-1))].maxContextLength")
-    profile="$CONFIG_DIR/lms-$(slug "$chosen").json"
+    if (( selection == 0 )); then
+      # Synthetic: use the loaded model directly; no profile on disk yet.
+      # Falls through to the save-new-profile block below.
+      chosen="$loaded_key"
+      chosen_max_ctx=$(echo "$models_json" | jq -r --arg k "$loaded_key" --arg mk "$loaded_id" '.[] | select(.modelKey == $k or .modelKey == $mk) | .maxContextLength' 2>/dev/null | head -1)
+      [[ -z "$chosen_max_ctx" || "$chosen_max_ctx" == "null" ]] && chosen_max_ctx=65536
+      profile="$loaded_profile_path"
+    else
+      chosen=$(echo "$models_json" | jq -r ".[$((selection-1))].modelKey")
+      chosen_max_ctx=$(echo "$models_json" | jq -r ".[$((selection-1))].maxContextLength")
+      profile="$CONFIG_DIR/lms-$(slug "$chosen").json"
+    fi
   fi
 
   # Load or edit profile

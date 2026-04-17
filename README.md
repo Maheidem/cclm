@@ -186,6 +186,30 @@ cclm log --json             # dump raw JSONL (combines with filters above)
 
 If the log file does not exist yet, `cclm log` prints `No sessions logged yet.` and exits 0. Override the log location with `CCLM_CACHE_DIR=/some/path` (the file is always `$CCLM_CACHE_DIR/sessions.log`).
 
+### Benchmarking (`cclm bench`)
+
+Compare throughput across saved profiles without launching `claude`. `cclm bench` POSTs a short prompt to `/v1/chat/completions` on each backend and reports wallclock, prompt/completion tokens, and tokens/second in a markdown-style table.
+
+```bash
+cclm bench                                            # bench every saved profile (except zai)
+cclm bench --profiles lms-qwen3,ollama-llama3         # comma-separated subset
+cclm bench --iterations 3                             # per-iter rows + a mean row per profile
+cclm bench --prompt-file ./my-prompt.txt              # custom prompt (keep it short, <= ~50 tok)
+cclm bench --dry-run                                  # print the curl commands, don't execute
+```
+
+Output goes to stdout (pipe-safe: `cclm bench | tee bench.md`); progress and skip warnings go to stderr. Exit code is 0 if at least one profile benches successfully, non-zero only if every profile fails.
+
+| Field | Notes |
+|---|---|
+| `wallclock (s)` | Measured via zsh `$EPOCHREALTIME` (float seconds, sub-millisecond) |
+| `prompt_tok` / `completion_tok` | Read directly from the backend's `usage.*` fields |
+| `tok/s` | `completion_tok / wallclock` (includes network + queue, not server-internal throughput) |
+
+**Auth:** no `Authorization` header is sent by default — local backends (LM Studio, llama.cpp, Ollama, vLLM) accept unauthenticated requests on localhost. For remote endpoints that require a key, set `CCLM_BENCH_API_KEY` in the environment; it is sent as `Authorization: Bearer <key>`.
+
+**Limitations:** `zai-*.json` profiles are skipped with a stderr warning. Z.ai speaks the Anthropic-native `/v1/messages` protocol, which has a different request/response shape than OpenAI chat completions; a future pass may add native support. Profiles with missing `host` or `model` fields are also skipped. An unreachable backend is a per-profile warning, never a hard exit.
+
 ### Classic flow
 
 When no profiles exist or you choose "New session":
@@ -195,6 +219,8 @@ When no profiles exist or you choose "New session":
 3. Tune parameters (ctx, GPU layers, sampling, port, timeout…) — current profile values are used as defaults on subsequent runs
 4. For local `llama.cpp`: server starts, `cclm` polls `/health`, then launches `claude` — `llama-server` is killed on exit
 5. For remote hosts: `cclm` prints a copy-pasteable one-liner to run there, polls for readiness, then launches `claude`
+
+**LM Studio auto-detection:** the `--lms` picker queries `lms ps` on start. If a model is already loaded, it becomes the default (press Enter to accept) when a saved profile exists for it; otherwise cclm offers a synthetic `0) Use currently-loaded model: …` entry at the top of the list and falls through to the usual "save new profile?" prompt. If `lms ps` fails or nothing is loaded, the picker behaves exactly as before.
 
 ## Profiles
 
