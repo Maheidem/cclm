@@ -52,27 +52,37 @@ human_size() {
 # Last session state (populated by load_last_session)
 last_backend="" last_profile="" last_remote="" last_model=""
 
-# Load last session state from STATE_FILE
+# Load last session state from STATE_FILE. Always returns 0; caller checks
+# whether last_backend/last_profile are populated.
 load_last_session() {
   if [[ -f "$STATE_FILE" ]]; then
-    last_backend=$(jq -r '.backend // empty' "$STATE_FILE")
-    last_profile=$(jq -r '.profile // empty' "$STATE_FILE")
-    last_remote=$(jq -r '.remote_host // empty' "$STATE_FILE")
-    last_model=$(jq -r '.model // empty' "$STATE_FILE")
-    return 0
+    last_backend=$(jq -r '.backend // empty' "$STATE_FILE" 2>/dev/null || true)
+    last_profile=$(jq -r '.profile // empty' "$STATE_FILE" 2>/dev/null || true)
+    last_remote=$(jq -r '.remote_host // empty' "$STATE_FILE" 2>/dev/null || true)
+    last_model=$(jq -r '.model // empty' "$STATE_FILE" 2>/dev/null || true)
   fi
-  return 1
+  return 0
 }
 
-# Save last session state to STATE_FILE
+# Save last session state to STATE_FILE. Best-effort — warns but does not
+# abort cclm if write fails (e.g. disk full, read-only FS).
 save_last_session() {
   local backend="$1" profile="$2" remote_host="$3" model="$4"
-  jq -n \
+  local _tmp
+  _tmp="$(mktemp 2>/dev/null)" || { echo "Warning: could not create temp file for state save" >&2; return 0; }
+  if ! jq -n \
     --arg be "$backend" \
     --arg prof "$profile" \
     --arg rh "${remote_host:-}" \
     --arg mod "$model" \
-    '{backend: $be, profile: $prof, remote_host: $rh, model: $mod}' > "$STATE_FILE"
+    '{backend: $be, profile: $prof, remote_host: $rh, model: $mod}' > "$_tmp" 2>/dev/null
+  then
+    rm -f "$_tmp"
+    echo "Warning: could not save last-session state" >&2
+    return 0
+  fi
+  mv "$_tmp" "$STATE_FILE" 2>/dev/null || { rm -f "$_tmp"; echo "Warning: could not write $STATE_FILE" >&2; }
+  return 0
 }
 
 # Set env vars and launch claude. Args: mode, api_id, host, port, context_length, extra_claude_args...
@@ -91,16 +101,23 @@ launch_claude() {
 
   # Auth: real token (remote providers) vs placeholder (local).
   # CCLM_AUTH_TOKEN is set by backends that talk to real cloud endpoints.
+  # Unset it after consumption so it can't leak to MCP servers, hooks, or subagents.
   if [[ -n "${CCLM_AUTH_TOKEN:-}" ]]; then
     export ANTHROPIC_AUTH_TOKEN="$CCLM_AUTH_TOKEN"
+    unset CCLM_AUTH_TOKEN
     unset ANTHROPIC_API_KEY
   else
     export ANTHROPIC_API_KEY="lmstudio"
     unset ANTHROPIC_AUTH_TOKEN
   fi
-  # Always clear subscription tokens so they can't leak through.
+  # Always clear subscription tokens and provider-routing env vars so they can't leak through.
   unset CLAUDE_CODE_OAUTH_TOKEN
   unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  unset CLAUDE_CODE_USE_BEDROCK
+  unset CLAUDE_CODE_USE_VERTEX
+  unset ANTHROPIC_BEDROCK_BASE_URL
+  unset ANTHROPIC_VERTEX_PROJECT_ID
+  unset ANTHROPIC_CUSTOM_HEADERS
 
   export ANTHROPIC_MODEL="$api_id"
   # Per-tier routing: backends that support distinct models per Claude tier
@@ -144,7 +161,7 @@ launch_claude() {
 
 for f in "$CONFIG_DIR"/*.json(N); do
   _base="${f:t}"
-  if [[ "$_base" != lms-* && "$_base" != llama-* && "$_base" != zai-* ]]; then
+  if [[ "$_base" != lms-* && "$_base" != llama-* && "$_base" != zai-* && "$_base" != remote-* ]]; then
     mv "$f" "$CONFIG_DIR/lms-${_base}"
   fi
 done
@@ -169,15 +186,17 @@ while (( $# )); do
     --llama)  backend="llama" ;;
     --zai)    backend="zai" ;;
     --remote) backend="remote" ;;
-    --host)  remote_host="$2"; shift ;;
+    --host)
+      [[ $# -ge 2 ]] || { echo "--host requires an argument" >&2; exit 2; }
+      remote_host="$2"; shift ;;
     --host=*) remote_host="${1#--host=}" ;;
     *)       passthrough_args+=("$1") ;;
   esac
   shift
 done
 
-# Try to load last session (return 1 is normal on first run — no state file yet).
-load_last_session || true
+# Load last session state (always returns 0; last_* may be empty on first run).
+load_last_session
 
 # ============================================================================
 # Profile Picker
@@ -211,21 +230,20 @@ pick_profile() {
 
       case "$be_tag" in
         llama)
-          model_name=$(jq -r '.model // "${base}"' "$f")
+          model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
           local rh=$(jq -r '.remote_host // empty' "$f")
           host_info="${rh:+remote:$rh}"
           [[ -z "$host_info" ]] && host_info="local"
           ctx_info=$(jq -r '.ctx_len // "?"' "$f")
           ;;
         lms)
-          model_name=$(jq -r '.model // "${base}"' "$f")
+          model_name=$(jq -r --arg b "$base" '.model // $b' "$f")
           local rh=$(jq -r '.remote_host // empty' "$f")
           host_info="${rh:+remote:$rh}"
           [[ -z "$host_info" ]] && host_info="local"
           ctx_info=$(jq -r '.context_length // "?"' "$f")
           ;;
         zai)
-          local pname="${base#zai-}"; pname="${pname%.json}"
           model_name=$(jq -r '.sonnet_model // "?"' "$f")
           host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
           ctx_info=$(jq -r '.context_length // "?"' "$f")
@@ -266,10 +284,10 @@ pick_profile() {
     # Action sub-menu
     local display_model
     case "$picked_backend" in
-      llama)  display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      lms)    display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      zai)    display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
-      remote) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      llama)  display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      lms)    display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      zai)    display_model=$(jq -r --arg b "$picked_base" '.sonnet_model // $b' "$picked") ;;
+      remote) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
     esac
 
     echo "" >&2
@@ -440,7 +458,7 @@ run_lms() {
           exit 1
         fi
         local loaded_id
-        loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty')
+        loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty' 2>/dev/null || true)
         if [[ -n "$loaded_id" && "$loaded_id" != "$_pl_model" ]]; then
           echo "Unloading: $loaded_id" >&2
           lms unload "$loaded_id" 2>/dev/null || true
@@ -453,24 +471,15 @@ run_lms() {
         echo "  ctx:$_pl_ctx  gpu:$_pl_gpu  parallel:$_pl_parallel" >&2
         lms load "${load_args[@]}"
         local api_id
-        api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end')
+        api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end' 2>/dev/null || true)
         save_last_session "lms" "$(basename "$_PRELOADED_PROFILE")" "$LMS_HOST" "$api_id"
         launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$_pl_ctx" "${passthrough_args[@]}"
       fi
       return
     else
-      # Edit: fall through to existing flow with profile context
-      # Set lms_model_key for remote path or chosen for local path
-      # The existing code will show config prompts with current values as defaults
-      if $is_lms_remote; then
-        # For remote, let the normal flow run — user will re-enter model key
-        # but the profile will be there for "Use saved?" prompt
-        :
-      else
-        # For local, pre-set chosen so model listing is skipped
-        # (declared below in local flow — will be checked with -z)
-        :
-      fi
+      # Edit: fall through to existing flow, but skip model selection
+      # and force re-prompt of parameters with profile values as defaults.
+      EDIT_MODE=true
     fi
   fi
 
@@ -486,24 +495,35 @@ run_lms() {
       echo "" >&2
 
       local lms_model_key lms_ctx lms_gpu lms_parallel lms_profile
-      lms_model_key=$(ask "Model key on $LMS_HOST (e.g., qwen/qwen3.5-27b)" "")
-      if [[ -z "$lms_model_key" ]]; then
-        echo "Model key is required." >&2
-        exit 1
+      if [[ "${EDIT_MODE:-false}" == "true" ]]; then
+        lms_model_key=$(jq -r '.model' "$_PRELOADED_PROFILE")
+        echo "Editing profile for: $lms_model_key" >&2
+      else
+        lms_model_key=$(ask "Model key on $LMS_HOST (e.g., qwen/qwen3.5-27b)" "")
+        if [[ -z "$lms_model_key" ]]; then
+          echo "Model key is required." >&2
+          exit 1
+        fi
       fi
       lms_profile="$CONFIG_DIR/lms-$(slug "$lms_model_key").json"
 
       local use_lms_saved=false
       if [[ -f "$lms_profile" ]]; then
-        echo "" >&2
-        echo "Saved profile for $lms_model_key:" >&2
-        printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$lms_profile")" >&2
-        printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$lms_profile")" >&2
-        printf "  %-20s %s\n" "Parallel:" "$(jq -r '.parallel' "$lms_profile")" >&2
-        echo "" >&2
-        printf "Use saved profile? (Y/n): " >&2
-        read -r use_reply
-        [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_lms_saved=true
+        if [[ "${EDIT_MODE:-false}" == "true" ]]; then
+          echo "" >&2
+          echo "Edit mode: current values shown as defaults below." >&2
+          use_lms_saved=false
+        else
+          echo "" >&2
+          echo "Saved profile for $lms_model_key:" >&2
+          printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$lms_profile")" >&2
+          printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$lms_profile")" >&2
+          printf "  %-20s %s\n" "Parallel:" "$(jq -r '.parallel' "$lms_profile")" >&2
+          echo "" >&2
+          printf "Use saved profile? (Y/n): " >&2
+          read -r use_reply
+          [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_lms_saved=true
+        fi
       fi
 
       local d_lctx="65536" d_lgpu="max" d_lpar="1"
@@ -566,39 +586,47 @@ run_lms() {
       return
     fi
 
-    # Server IS running: query and select model
-    local api_models
-    api_models=$(curl -s "${LMS_URL}/v1/models" 2>/dev/null | jq -r '.data[].id' | grep -v 'embedding')
+    # Server IS running: query and select model (or use profile's in edit mode)
+    local api_id
+    if [[ "${EDIT_MODE:-false}" == "true" ]]; then
+      api_id=$(jq -r '.model' "$_PRELOADED_PROFILE")
+      echo "Editing profile for: $api_id" >&2
+    else
+      local api_models
+      api_models=$(curl -s "${LMS_URL}/v1/models" 2>/dev/null \
+        | jq -r '.data[].id | select(contains("embedding") | not)' 2>/dev/null || true)
 
-    if [[ -z "$api_models" ]]; then
-      echo "No models available on remote LM Studio at ${LMS_URL}" >&2
-      exit 1
+      if [[ -z "$api_models" ]]; then
+        echo "No models available on remote LM Studio at ${LMS_URL}" >&2
+        exit 1
+      fi
+
+      echo "" >&2
+      echo "Models on remote LM Studio (${LMS_HOST}):" >&2
+      echo "" >&2
+      local count=0
+      local model_list=()
+      while IFS= read -r mid; do
+        count=$((count + 1))
+        model_list+=("$mid")
+        printf "  %d) %s\n" "$count" "$mid" >&2
+      done <<< "$api_models"
+      echo "" >&2
+
+      printf "Select model (1-%d): " "$count" >&2
+      read -r selection
+
+      if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
+        echo "Invalid selection." >&2
+        exit 1
+      fi
+
+      api_id="${model_list[$selection]}"
     fi
-
     echo "" >&2
-    echo "Models on remote LM Studio (${LMS_HOST}):" >&2
-    echo "" >&2
-    local count=0
-    local model_list=()
-    while IFS= read -r mid; do
-      count=$((count + 1))
-      model_list+=("$mid")
-      printf "  %d) %s\n" "$count" "$mid" >&2
-    done <<< "$api_models"
-    echo "" >&2
-
-    printf "Select model (1-%d): " "$count" >&2
-    read -r selection
-
-    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
-      echo "Invalid selection." >&2
-      exit 1
-    fi
-
-    local api_id="${model_list[$selection]}"
-    echo "" >&2
-    local ctx_size
-    ctx_size=$(ask "Context window (tokens)" "65536")
+    local ctx_size d_ctx="65536"
+    [[ "${EDIT_MODE:-false}" == "true" ]] && d_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+    ctx_size=$(ask "Context window (tokens)" "$d_ctx")
 
     save_last_session "lms" "lms-$(slug "$api_id").json" "$LMS_HOST" "$api_id"
     launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
@@ -621,60 +649,75 @@ run_lms() {
   fi
 
   local loaded_id
-  loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty')
-
-  echo "" >&2
-  echo "Available LM Studio models:" >&2
-  echo "" >&2
-  local count
-  count=$(echo "$models_json" | jq 'length')
-  local key display params max_ctx tool_use loaded_marker tool_tag saved_tag
-  for ((i=0; i<count; i++)); do
-    loaded_marker="" tool_tag="" saved_tag=""
-    key=$(echo "$models_json" | jq -r ".[$i].modelKey")
-    display=$(echo "$models_json" | jq -r ".[$i].displayName")
-    params=$(echo "$models_json" | jq -r ".[$i].paramsString")
-    max_ctx=$(echo "$models_json" | jq -r ".[$i].maxContextLength")
-    tool_use=$(echo "$models_json" | jq -r ".[$i].trainedForToolUse")
-    [[ "$key" = "$loaded_id" ]] && loaded_marker=" [LOADED]"
-    [[ "$tool_use" = "true" ]] && tool_tag=" tools"
-    [[ -f "$CONFIG_DIR/lms-$(slug "$key").json" ]] && saved_tag=" *"
-    printf "  %d) %-30s %6s  ctx:%dk%s%s%s\n" \
-      $((i+1)) "$display" "$params" $((max_ctx/1024)) "$tool_tag" "$loaded_marker" "$saved_tag" >&2
-  done
-  echo "" >&2
-  echo "  (* = saved profile)" >&2
-  echo "" >&2
-
-  printf "Select model (1-%d): " "$count" >&2
-  read -r selection
-
-  if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
-    echo "Invalid selection." >&2
-    exit 1
-  fi
+  loaded_id=$(lms ps --json 2>/dev/null | jq -r '.[0].modelKey // empty' 2>/dev/null || true)
 
   local chosen chosen_max_ctx profile
-  chosen=$(echo "$models_json" | jq -r ".[$((selection-1))].modelKey")
-  chosen_max_ctx=$(echo "$models_json" | jq -r ".[$((selection-1))].maxContextLength")
-  profile="$CONFIG_DIR/lms-$(slug "$chosen").json"
+  if [[ "${EDIT_MODE:-false}" == "true" ]]; then
+    chosen=$(jq -r '.model' "$_PRELOADED_PROFILE")
+    chosen_max_ctx=$(echo "$models_json" | jq -r --arg k "$chosen" '.[] | select(.modelKey == $k) | .maxContextLength' 2>/dev/null | head -1)
+    [[ -z "$chosen_max_ctx" ]] && chosen_max_ctx=65536
+    profile="$_PRELOADED_PROFILE"
+    echo "" >&2
+    echo "Editing profile for: $chosen" >&2
+  else
+    echo "" >&2
+    echo "Available LM Studio models:" >&2
+    echo "" >&2
+    local count
+    count=$(echo "$models_json" | jq 'length')
+    local key display params max_ctx tool_use loaded_marker tool_tag saved_tag
+    for ((i=0; i<count; i++)); do
+      loaded_marker="" tool_tag="" saved_tag=""
+      key=$(echo "$models_json" | jq -r ".[$i].modelKey")
+      display=$(echo "$models_json" | jq -r ".[$i].displayName")
+      params=$(echo "$models_json" | jq -r ".[$i].paramsString")
+      max_ctx=$(echo "$models_json" | jq -r ".[$i].maxContextLength")
+      tool_use=$(echo "$models_json" | jq -r ".[$i].trainedForToolUse")
+      [[ "$key" = "$loaded_id" ]] && loaded_marker=" [LOADED]"
+      [[ "$tool_use" = "true" ]] && tool_tag=" tools"
+      [[ -f "$CONFIG_DIR/lms-$(slug "$key").json" ]] && saved_tag=" *"
+      printf "  %d) %-30s %6s  ctx:%dk%s%s%s\n" \
+        $((i+1)) "$display" "$params" $((max_ctx/1024)) "$tool_tag" "$loaded_marker" "$saved_tag" >&2
+    done
+    echo "" >&2
+    echo "  (* = saved profile)" >&2
+    echo "" >&2
+
+    printf "Select model (1-%d): " "$count" >&2
+    read -r selection
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > count )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+
+    chosen=$(echo "$models_json" | jq -r ".[$((selection-1))].modelKey")
+    chosen_max_ctx=$(echo "$models_json" | jq -r ".[$((selection-1))].maxContextLength")
+    profile="$CONFIG_DIR/lms-$(slug "$chosen").json"
+  fi
 
   # Load or edit profile
   local use_saved=false
   if [[ -f "$profile" ]]; then
-    echo "" >&2
-    echo "Saved profile for $chosen:" >&2
-    echo "" >&2
-    printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$profile")" >&2
-    printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$profile")" >&2
-    printf "  %-20s %s\n" "Parallel requests:" "$(jq -r '.parallel' "$profile")" >&2
-    printf "  %-20s %s\n" "TTL (seconds):" "$(jq -r '.ttl' "$profile")" >&2
-    printf "  %-20s %s\n" "API identifier:" "$(jq -r '.identifier' "$profile")" >&2
-    echo "" >&2
-    printf "Use saved profile? (Y/n): " >&2
-    read -r use_reply
-    if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
-      use_saved=true
+    if [[ "${EDIT_MODE:-false}" == "true" ]]; then
+      echo "" >&2
+      echo "Edit mode: current values shown as defaults below." >&2
+      use_saved=false
+    else
+      echo "" >&2
+      echo "Saved profile for $chosen:" >&2
+      echo "" >&2
+      printf "  %-20s %s\n" "Context length:" "$(jq -r '.context_length' "$profile")" >&2
+      printf "  %-20s %s\n" "GPU offload:" "$(jq -r '.gpu' "$profile")" >&2
+      printf "  %-20s %s\n" "Parallel requests:" "$(jq -r '.parallel' "$profile")" >&2
+      printf "  %-20s %s\n" "TTL (seconds):" "$(jq -r '.ttl // "-"' "$profile")" >&2
+      printf "  %-20s %s\n" "API identifier:" "$(jq -r '.identifier // "-"' "$profile")" >&2
+      echo "" >&2
+      printf "Use saved profile? (Y/n): " >&2
+      read -r use_reply
+      if [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]]; then
+        use_saved=true
+      fi
     fi
   fi
 
@@ -749,7 +792,7 @@ run_lms() {
 
   # Resolve API identifier
   local api_id
-  api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end')
+  api_id=$(lms ps --json 2>/dev/null | jq -r '.[0] | if .identifier == null or .identifier == "null" then .modelKey else .identifier end' 2>/dev/null || true)
 
   save_last_session "lms" "lms-$(slug "$api_id").json" "$LMS_HOST" "$api_id"
   launch_claude exec "$api_id" "$LMS_HOST" "$LMS_PORT" "$ctx_size" "${passthrough_args[@]}"
@@ -804,33 +847,38 @@ run_llama() {
     fi
 
     if [[ -f "$profile" ]] && ! $use_saved; then
-      echo "" >&2
-      echo "Saved profile for $model_id:" >&2
-      echo "" >&2
-      echo "  Loading:" >&2
-      printf "    %-20s %s\n" "Model path:" "$(jq -r '.model_path' "$profile")" >&2
-      printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
-      printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
-      printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
-      printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
-      printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
-      printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
-      printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
-      printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
-      echo "  Sampling:" >&2
-      printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
-      printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
-      printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
-      printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
-      printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
-      echo "  Server:" >&2
-      printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
-      printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
-      printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
-      echo "" >&2
-      printf "Use saved profile? (Y/n): " >&2
-      read -r use_reply
-      [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_saved=true
+      if [[ "${_PRELOADED_ACTION:-}" == "edit" ]]; then
+        echo "" >&2
+        echo "Edit mode: current values shown as defaults below." >&2
+      else
+        echo "" >&2
+        echo "Saved profile for $model_id:" >&2
+        echo "" >&2
+        echo "  Loading:" >&2
+        printf "    %-20s %s\n" "Model path:" "$(jq -r '.model_path' "$profile")" >&2
+        printf "    %-20s %s\n" "Context length:" "$(jq -r '.ctx_len' "$profile")" >&2
+        printf "    %-20s %s\n" "GPU layers:" "$(jq -r '.gpu_layers' "$profile")" >&2
+        printf "    %-20s %s\n" "Flash attention:" "$(jq -r '.flash_attn' "$profile")" >&2
+        printf "    %-20s %s\n" "Cache type K:" "$(jq -r '.cache_type_k' "$profile")" >&2
+        printf "    %-20s %s\n" "Cache type V:" "$(jq -r '.cache_type_v' "$profile")" >&2
+        printf "    %-20s %s\n" "SWA full:" "$(jq -r '.swa_full' "$profile")" >&2
+        printf "    %-20s %s\n" "Batch size:" "$(jq -r '.batch_size' "$profile")" >&2
+        printf "    %-20s %s\n" "Ubatch size:" "$(jq -r '.ubatch_size' "$profile")" >&2
+        echo "  Sampling:" >&2
+        printf "    %-20s %s\n" "Temperature:" "$(jq -r '.temperature' "$profile")" >&2
+        printf "    %-20s %s\n" "Top-P:" "$(jq -r '.top_p' "$profile")" >&2
+        printf "    %-20s %s\n" "Top-K:" "$(jq -r '.top_k' "$profile")" >&2
+        printf "    %-20s %s\n" "Min-P:" "$(jq -r '.min_p' "$profile")" >&2
+        printf "    %-20s %s\n" "Repeat penalty:" "$(jq -r '.repeat_penalty' "$profile")" >&2
+        echo "  Server:" >&2
+        printf "    %-20s %s\n" "Port:" "$(jq -r '.port' "$profile")" >&2
+        printf "    %-20s %s\n" "Parallel slots:" "$(jq -r '.parallel_slots' "$profile")" >&2
+        printf "    %-20s %s\n" "Slot save path:" "$(jq -r '.slot_save_path // ""' "$profile")" >&2
+        echo "" >&2
+        printf "Use saved profile? (Y/n): " >&2
+        read -r use_reply
+        [[ -z "$use_reply" || "$use_reply" =~ ^[Yy]$ ]] && use_saved=true
+      fi
     fi
 
     if $use_saved; then
@@ -1216,13 +1264,33 @@ run_llama() {
   if lsof -i ":${port}" -sTCP:LISTEN > /dev/null 2>&1; then
     echo "" >&2
     echo "Port ${port} is already in use." >&2
-    local pid_on_port
-    pid_on_port=$(lsof -ti ":${port}" -sTCP:LISTEN 2>/dev/null | head -1)
-    printf "Kill process %s and continue? (y/N): " "$pid_on_port" >&2
+    local pids_on_port
+    pids_on_port=$(lsof -ti ":${port}" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')
+    printf "Kill process(es) %s and continue? (y/N): " "${pids_on_port% }" >&2
     read -r kill_reply
     if [[ "$kill_reply" =~ ^[Yy]$ ]]; then
-      kill "$pid_on_port" 2>/dev/null || true
-      sleep 1
+      local _pid
+      for _pid in ${=pids_on_port}; do
+        kill "$_pid" 2>/dev/null || true
+      done
+      # Wait up to ~2s for port to free; escalate to SIGKILL if still in use.
+      local _waited=0
+      while (( _waited < 20 )); do
+        sleep 0.1
+        lsof -i ":${port}" -sTCP:LISTEN > /dev/null 2>&1 || break
+        (( _waited++ ))
+      done
+      if lsof -i ":${port}" -sTCP:LISTEN > /dev/null 2>&1; then
+        echo "Port still in use after SIGTERM; escalating to SIGKILL..." >&2
+        for _pid in ${=pids_on_port}; do
+          kill -9 "$_pid" 2>/dev/null || true
+        done
+        sleep 0.5
+      fi
+      if lsof -i ":${port}" -sTCP:LISTEN > /dev/null 2>&1; then
+        echo "Could not free port ${port}. Aborting." >&2
+        exit 1
+      fi
     else
       echo "Aborted." >&2
       exit 1
@@ -1269,7 +1337,9 @@ run_llama() {
   echo "  Port:  $port" >&2
   [[ -n "$mmproj_path" ]] && echo "  mmproj: ${mmproj_path:t}" >&2
 
-  local server_log="/tmp/cclm-llama-server.log"
+  local cache_dir="${CCLM_CACHE_DIR:-$HOME/.cache/cclm}"
+  mkdir -p "$cache_dir" 2>/dev/null || true
+  local server_log="${CCLM_LOG_FILE:-$cache_dir/llama-server.log}"
   llama-server "${server_args[@]}" > "$server_log" 2>&1 &
   LLAMA_PID=$!
 
@@ -1328,23 +1398,30 @@ run_zai() {
       echo "No key provided. Aborting." >&2
       exit 1
     fi
-
-    # Persist to ~/.zshenv — loaded by every zsh invocation (login or not),
-    # unlike ~/.zshrc which is interactive-only.
-    local zshenv="$HOME/.zshenv"
-    touch "$zshenv"
-    if grep -qE '^[[:space:]]*export[[:space:]]+ZAI_API_KEY=' "$zshenv" 2>/dev/null; then
-      local _tmp
-      _tmp="$(mktemp)"
-      grep -vE '^[[:space:]]*export[[:space:]]+ZAI_API_KEY=' "$zshenv" > "$_tmp" || true
-      mv "$_tmp" "$zshenv"
-      echo "Replaced existing ZAI_API_KEY in $zshenv" >&2
-    else
-      echo "Saved ZAI_API_KEY to $zshenv (loaded by all zsh sessions)" >&2
-    fi
-    printf "export ZAI_API_KEY=%q\n" "$_key" >> "$zshenv"
-    chmod 600 "$zshenv"
     export ZAI_API_KEY="$_key"
+
+    printf "  Save to ~/.zshenv so all sessions see it? (y/N): " >&2
+    local _persist
+    read -r _persist
+    if [[ "$_persist" =~ ^[Yy]$ ]]; then
+      # Persist to ~/.zshenv — loaded by every zsh invocation (login or not),
+      # unlike ~/.zshrc which is interactive-only.
+      local zshenv="$HOME/.zshenv"
+      touch "$zshenv"
+      if grep -qE '^[[:space:]]*export[[:space:]]+ZAI_API_KEY=' "$zshenv" 2>/dev/null; then
+        local _tmp
+        _tmp="$(mktemp)"
+        grep -vE '^[[:space:]]*export[[:space:]]+ZAI_API_KEY=' "$zshenv" > "$_tmp" || true
+        mv "$_tmp" "$zshenv"
+        echo "  Replaced existing ZAI_API_KEY in $zshenv" >&2
+      else
+        echo "  Saved ZAI_API_KEY to $zshenv (loaded by all zsh sessions)" >&2
+      fi
+      printf "export ZAI_API_KEY=%q\n" "$_key" >> "$zshenv"
+      chmod 600 "$zshenv"
+    else
+      echo "  Keeping key in this shell only." >&2
+    fi
   fi
 
   # --- Preload fast-path (from profile picker) ---
@@ -1600,6 +1677,9 @@ run_zai() {
     echo "" >&2
     ctx="$(ask 'Context length (tokens)' "$d_ctx")"
     timeout_ms="$(ask 'API_TIMEOUT_MS' "$d_timeout_ms")"
+
+    [[ "$ctx" =~ ^[0-9]+$ ]] || { echo "Context length must be a positive integer (got: $ctx)" >&2; exit 1; }
+    [[ "$timeout_ms" =~ ^[0-9]+$ ]] || { echo "API_TIMEOUT_MS must be a positive integer (got: $timeout_ms)" >&2; exit 1; }
 
     # --- 7. Save profile ---
     jq -n \
