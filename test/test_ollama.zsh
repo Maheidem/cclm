@@ -24,3 +24,16 @@ assert_contains "$OUTPUT" "Model:" "Model label rendered"
 assert_contains "$OUTPUT" "llama3.2" "Model value (llama3.2) rendered"
 assert_contains "$OUTPUT" "Context length:" "Context length label rendered"
 assert_contains "$OUTPUT" "128000" "Context length value rendered"
+
+# Shared OpenAI-compat helper must exist and both wrappers must delegate to it.
+ASSERTIONS=$((ASSERTIONS + 1))
+if ! typeset -f _run_openai_compat > /dev/null 2>&1; then
+  _fail "_run_openai_compat helper not defined"
+fi
+
+# Wrapper bodies pin their dispatch-table tuple (tag, port, resolve flag).
+OLLAMA_BODY=$(typeset -f run_ollama)
+assert_contains "$OLLAMA_BODY" "_run_openai_compat ollama 11434 1" "run_ollama delegates with ollama/11434/resolve=1"
+
+VLLM_BODY=$(typeset -f run_vllm)
+assert_contains "$VLLM_BODY" "_run_openai_compat vllm 8000 0" "run_vllm delegates with vllm/8000/resolve=0"
