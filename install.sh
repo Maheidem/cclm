@@ -35,9 +35,17 @@ fi
 
 # ── Install binary ───────────────────────────────────────────────────────────
 mkdir -p "$BIN_DST_DIR"
-cp "$BIN_SRC" "$BIN_DST"
-chmod +x "$BIN_DST"
-echo "Installed: $BIN_DST"
+if [[ -f "$BIN_DST" ]] && ! cmp -s "$BIN_SRC" "$BIN_DST"; then
+  if [[ "${FORCE:-0}" != "1" ]]; then
+    read -r -p "Overwrite existing $BIN_DST? (y/N): " _ow
+    [[ "$_ow" =~ ^[Yy]$ ]] || { echo "Skipping binary install (re-run with FORCE=1 to bypass)."; SKIP_BIN=1; }
+  fi
+fi
+if [[ "${SKIP_BIN:-0}" != "1" ]]; then
+  cp "$BIN_SRC" "$BIN_DST"
+  chmod +x "$BIN_DST"
+  echo "Installed: $BIN_DST"
+fi
 
 # ── Config dir ───────────────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR"
@@ -46,13 +54,29 @@ echo "Config dir: $CONFIG_DIR"
 # ── Optional SwiftBar plugin (macOS only) ────────────────────────────────────
 if [[ "$(uname)" == "Darwin" ]]; then
   SWIFTBAR_DIR="$HOME/Library/Application Support/SwiftBar/plugins"
+  SWIFTBAR_PLUGIN="$SWIFTBAR_DIR/llama-monitor.5s.sh"
+  SWIFTBAR_SRC="$REPO_DIR/plugins/swiftbar/llama-monitor.5s.sh"
   if [[ -d "$SWIFTBAR_DIR" ]]; then
-    read -r -p "Install SwiftBar llama-server monitor plugin? (y/N): " reply
-    if [[ "$reply" =~ ^[Yy]$ ]]; then
-      cp "$REPO_DIR/plugins/swiftbar/llama-monitor.5s.sh" "$SWIFTBAR_DIR/"
-      chmod +x "$SWIFTBAR_DIR/llama-monitor.5s.sh"
-      echo "Installed SwiftBar plugin to: $SWIFTBAR_DIR/llama-monitor.5s.sh"
-      echo "Refresh SwiftBar (menu bar icon → Refresh all) to activate it."
+    if [[ -f "$SWIFTBAR_PLUGIN" ]] && cmp -s "$SWIFTBAR_SRC" "$SWIFTBAR_PLUGIN"; then
+      echo "SwiftBar plugin already up to date — skipping."
+    else
+      _prompt="Install SwiftBar llama-server monitor plugin? (y/N): "
+      [[ -f "$SWIFTBAR_PLUGIN" ]] && _prompt="Update SwiftBar llama-server monitor plugin? (Y/n): "
+      read -r -p "$_prompt" reply
+      # Default: y when updating existing, n when installing fresh
+      if [[ -f "$SWIFTBAR_PLUGIN" ]]; then
+        _install=true
+        [[ "$reply" =~ ^[Nn]$ ]] && _install=false
+      else
+        _install=false
+        [[ "$reply" =~ ^[Yy]$ ]] && _install=true
+      fi
+      if $_install; then
+        cp "$SWIFTBAR_SRC" "$SWIFTBAR_PLUGIN"
+        chmod +x "$SWIFTBAR_PLUGIN"
+        echo "Installed SwiftBar plugin to: $SWIFTBAR_PLUGIN"
+        echo "Refresh SwiftBar (menu bar icon → Refresh all) to activate it."
+      fi
     fi
   else
     echo "SwiftBar not detected at $SWIFTBAR_DIR — skipping plugin."

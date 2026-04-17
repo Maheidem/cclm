@@ -7,8 +7,10 @@
 export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.local/bin:/usr/bin:/bin:$PATH"
 
 PORT="${CCLM_PORT:-8081}"
-STATE_FILE="/tmp/cclm_llama_monitor.state"
-LOG_FILE="/tmp/cclm-llama-server.log"
+CACHE_DIR="${CCLM_CACHE_DIR:-$HOME/.cache/cclm}"
+mkdir -p "$CACHE_DIR" 2>/dev/null
+STATE_FILE="${CCLM_STATE_FILE:-$CACHE_DIR/llama_monitor.state}"
+LOG_FILE="${CCLM_LOG_FILE:-$CACHE_DIR/llama-server.log}"
 
 python3 - "$PORT" "$STATE_FILE" "$LOG_FILE" <<'PYEOF'
 import sys
@@ -106,8 +108,9 @@ if slots_data and isinstance(slots_data, list):
     n_slots = len(slots_data)
     for s in slots_data:
         state = s.get("state", 0)
-        # state 1 = processing
-        if state == 1:
+        # state 1 (int) or "PROCESSING"/"GENERATING" (newer builds) = processing
+        state_str = str(state).upper() if state is not None else ""
+        if state == 1 or state_str in ("PROCESSING", "GENERATING", "BUSY"):
             busy_slots += 1
             is_processing = True
             n_decoded = s.get("n_decoded", s.get("tokens_predicted", 0))
