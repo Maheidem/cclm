@@ -165,9 +165,10 @@ passthrough_args=()
 
 while (( $# )); do
   case "$1" in
-    --lms)   backend="lms" ;;
-    --llama) backend="llama" ;;
-    --zai)   backend="zai" ;;
+    --lms)    backend="lms" ;;
+    --llama)  backend="llama" ;;
+    --zai)    backend="zai" ;;
+    --remote) backend="remote" ;;
     --host)  remote_host="$2"; shift ;;
     --host=*) remote_host="${1#--host=}" ;;
     *)       passthrough_args+=("$1") ;;
@@ -188,7 +189,7 @@ pick_profile() {
   # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
 
   local -a profiles
-  profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+  profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote}-*.json(N) )
 
   # No saved profiles — skip picker entirely
   (( ${#profiles[@]} == 0 )) && return 1
@@ -202,9 +203,10 @@ pick_profile() {
     for f in "${profiles[@]}"; do
       local base="${f:t}"
       case "$base" in
-        llama-*) be_tag="llama" ;;
-        lms-*)   be_tag="lms" ;;
-        zai-*)   be_tag="zai" ;;
+        llama-*)  be_tag="llama" ;;
+        lms-*)    be_tag="lms" ;;
+        zai-*)    be_tag="zai" ;;
+        remote-*) be_tag="remote" ;;
       esac
 
       case "$be_tag" in
@@ -226,6 +228,13 @@ pick_profile() {
           local pname="${base#zai-}"; pname="${pname%.json}"
           model_name=$(jq -r '.sonnet_model // "?"' "$f")
           host_info=$(jq -r '.base_url // "z.ai"' "$f" | sed 's|https\?://||; s|/.*||')
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+        remote)
+          model_name=$(jq -r '.model // "?"' "$f")
+          local rh_p=$(jq -r '.host // "?"' "$f")
+          local rp_p=$(jq -r '.port // "1234"' "$f")
+          host_info="${rh_p}:${rp_p}"
           ctx_info=$(jq -r '.context_length // "?"' "$f")
           ;;
       esac
@@ -257,9 +266,10 @@ pick_profile() {
     # Action sub-menu
     local display_model
     case "$picked_backend" in
-      llama) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      lms)   display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
-      zai)   display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
+      llama)  display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      lms)    display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
+      zai)    display_model=$(jq -r '.sonnet_model // "$picked_base"' "$picked") ;;
+      remote) display_model=$(jq -r '.model // "$picked_base"' "$picked") ;;
     esac
 
     echo "" >&2
@@ -293,7 +303,7 @@ pick_profile() {
           rm "$picked"
           echo "  Deleted." >&2
           # Refresh list
-          profiles=( "$CONFIG_DIR"/{llama,lms,zai}-*.json(N) )
+          profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote}-*.json(N) )
           (( ${#profiles[@]} == 0 )) && return 1
         fi
         # Reset counter and re-display
@@ -327,12 +337,13 @@ elif [[ -z "$backend" ]]; then
   echo "  1) LM Studio" >&2
   echo "  2) llama.cpp" >&2
   echo "  3) Z.ai GLM (remote)" >&2
+  echo "  4) Remote (OpenAI-compatible: just IP + port + ctx)" >&2
   echo "" >&2
 
   if [[ -n "$last_backend" ]]; then
-    printf "Choice (0-3): " >&2
+    printf "Choice (0-4): " >&2
   else
-    printf "Choice (1-3): " >&2
+    printf "Choice (1-4): " >&2
   fi
   read -r bchoice
 
@@ -344,12 +355,13 @@ elif [[ -z "$backend" ]]; then
     1) backend="lms" ;;
     2) backend="llama" ;;
     3) backend="zai" ;;
+    4) backend="remote" ;;
     *) echo "Invalid selection." >&2; exit 1 ;;
   esac
 fi
 
-# Remote-host prompt applies to local-backend flows only; Z.ai picks its base URL inside run_zai.
-if [[ -z "$remote_host" && "$backend" != "zai" && -z "$_PRELOADED_PROFILE" ]]; then
+# Remote-host prompt applies to local-backend flows only; Z.ai and remote handle host internally.
+if [[ -z "$remote_host" && "$backend" != "zai" && "$backend" != "remote" && -z "$_PRELOADED_PROFILE" ]]; then
   printf "  Remote host               [local]: " >&2
   read -r _rhost
   remote_host="${_rhost:-}"
@@ -1623,11 +1635,116 @@ run_zai() {
 }
 
 # ============================================================================
+# Remote OpenAI-compatible Backend
+# For a server someone else manages (LM Studio / llama.cpp / vLLM / etc.).
+# We do NOT load, unload, or probe /health — the user asserts it's already up
+# and loaded. Single /v1/models probe is best-effort for the model picker only.
+# ============================================================================
+
+run_remote() {
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    local _pl_host _pl_port _pl_model _pl_ctx
+    _pl_host=$(jq -r '.host // ""' "$_PRELOADED_PROFILE")
+    _pl_port=$(jq -r '.port // "1234"' "$_PRELOADED_PROFILE")
+    _pl_model=$(jq -r '.model // ""' "$_PRELOADED_PROFILE")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+
+    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
+      echo "" >&2
+      echo "  [remote] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
+      save_last_session "remote" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
+      launch_claude exec "$_pl_model" "$_pl_host" "$_pl_port" "$_pl_ctx" "${passthrough_args[@]}"
+      return
+    fi
+    # Edit: fall through with defaults pre-filled
+  fi
+
+  # --- New session: collect host[:port] ---
+  local hp_default="${_pl_host:-}${_pl_port:+:$_pl_port}"
+  local hp
+  hp=$(ask "Remote endpoint (host or host:port, default port 1234)" "$hp_default")
+  if [[ -z "$hp" ]]; then
+    echo "Host is required." >&2
+    exit 1
+  fi
+
+  local r_host r_port
+  if [[ "$hp" == *:* ]]; then
+    r_host="${hp%:*}"
+    r_port="${hp##*:}"
+  else
+    r_host="$hp"
+    r_port="1234"
+  fi
+  local r_url="http://${r_host}:${r_port}"
+
+  # --- Best-effort model picker via /v1/models (single try, short timeout) ---
+  local r_model="${_pl_model:-}"
+  local api_models
+  api_models=$(curl -sf --max-time 2 "${r_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
+
+  if [[ -n "$api_models" ]]; then
+    echo "" >&2
+    echo "Models on ${r_host}:${r_port}:" >&2
+    echo "" >&2
+    local -a model_list=()
+    local count=0 mid
+    while IFS= read -r mid; do
+      [[ -z "$mid" ]] && continue
+      count=$((count + 1))
+      model_list+=("$mid")
+      printf "  %d) %s\n" "$count" "$mid" >&2
+    done <<< "$api_models"
+    echo "  m) Enter model id manually" >&2
+    echo "" >&2
+    printf "Select (1-%d or m): " "$count" >&2
+    read -r selection
+    if [[ "$selection" == "m" || "$selection" == "M" ]]; then
+      r_model=$(ask "Model id" "$r_model")
+    elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
+      r_model="${model_list[$selection]}"
+    else
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+  else
+    echo "" >&2
+    echo "  (/v1/models unreachable or empty — enter model id manually)" >&2
+    r_model=$(ask "Model id" "$r_model")
+  fi
+
+  if [[ -z "$r_model" ]]; then
+    echo "Model id is required." >&2
+    exit 1
+  fi
+
+  # --- Context window ---
+  local r_ctx
+  r_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
+
+  # --- Save profile ---
+  local r_profile="$CONFIG_DIR/remote-$(slug "${r_host}-${r_model}").json"
+  jq -n \
+    --arg host "$r_host" \
+    --arg port "$r_port" \
+    --arg model "$r_model" \
+    --arg ctx "$r_ctx" \
+    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$r_profile"
+  echo "" >&2
+  echo "Profile saved: $r_profile" >&2
+
+  save_last_session "remote" "$(basename "$r_profile")" "$r_host" "$r_model"
+  launch_claude exec "$r_model" "$r_host" "$r_port" "$r_ctx" "${passthrough_args[@]}"
+}
+
+# ============================================================================
 # Main dispatch — backend is set by profile picker or backend picker above
 # ============================================================================
 
 case "$backend" in
-  lms)   run_lms ;;
-  llama) run_llama ;;
-  zai)   run_zai ;;
+  lms)    run_lms ;;
+  llama)  run_llama ;;
+  zai)    run_zai ;;
+  remote) run_remote ;;
 esac
