@@ -2,12 +2,13 @@
 
 A zsh launcher that bridges [Claude Code](https://claude.com/code) with an LLM of your choice — local GPU, LAN host, or remote Anthropic-compatible API — without changing how you use `claude`. Pick a model, save a profile, and drop straight into Claude Code.
 
-Four backends are supported:
+Five backends are supported:
 
 - **`lms`** — [LM Studio](https://lmstudio.ai/) (local or remote, via `lms` CLI + OpenAI-compatible API)
 - **`llama`** — [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server` (local or remote)
 - **`zai`** — [Z.ai GLM](https://z.ai) remote Anthropic-compatible endpoint, with per-tier (Opus / Sonnet / Haiku) model selection
 - **`remote`** — generic OpenAI-compatible remote (base URL + model name + ctx)
+- **`ollama`** — [Ollama](https://ollama.com/) OpenAI-compatible endpoint (defaults to `localhost:11434`)
 
 ## Prerequisites
 
@@ -44,6 +45,7 @@ cclm --zai                 # Z.ai GLM remote (tier selection)
 cclm --remote              # generic OpenAI-compatible remote
 cclm --host <ip_or_name>   # remote host for --lms / --llama
 cclm --llama --resume      # any unknown arg is passed through to claude
+cclm --dry-run             # print env + would-be command, don't exec (alias: --print-env)
 ```
 
 ### Profile picker

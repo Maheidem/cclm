@@ -174,6 +174,13 @@ REMOTE_PROFILE_SCHEMA=(
   "Context length|.context_length"
 )
 
+OLLAMA_PROFILE_SCHEMA=(
+  "Host|.host"
+  "Port|.port"
+  "Model|.model"
+  "Context length|.context_length"
+)
+
 # schema_display: thin wrapper that pins the canonical call shape across
 # backends. Takes a profile path and a schema array (spread with "${arr[@]}").
 schema_display() {
@@ -299,11 +306,130 @@ launch_claude() {
   echo "Context: ${ctx} tokens  (CLAUDE_CODE_AUTO_COMPACT_WINDOW=${ctx})" >&2
   echo "" >&2
 
+  # --dry-run / --print-env: print the env vars cclm manages and the command
+  # that WOULD have been exec'd, then exit 0 without invoking claude.
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    env | grep -E '^(ANTHROPIC|CCLM|CLAUDE_CODE)_' | sort
+    print -r -- "claude --model ${(q)_CCLM_FAKE_SONNET} ${(q-)@}"
+    exit 0
+  fi
+
   if [[ "$mode" == "exec" ]]; then
     exec claude --model "$_CCLM_FAKE_SONNET" "$@"
   else
     claude --model "$_CCLM_FAKE_SONNET" "$@"
   fi
+}
+
+# ============================================================================
+# Ollama Backend
+# ============================================================================
+# Ollama exposes an OpenAI-compatible API at http://<host>:11434/v1.
+# Shape mirrors run_remote() but defaults to port 11434 and tags profiles
+# as ollama-<slug>.json so they're distinguishable in the picker.
+# Defined above the CCLM_LIB_ONLY guard so unit tests can assert on its
+# existence without triggering backend execution.
+
+run_ollama() {
+  # --- Preload fast-path (from profile picker) ---
+  if [[ -n "${_PRELOADED_PROFILE:-}" ]]; then
+    local _pl_host _pl_port _pl_model _pl_ctx
+    _pl_host=$(jq -r '.host // ""' "$_PRELOADED_PROFILE")
+    _pl_port=$(jq -r '.port // "11434"' "$_PRELOADED_PROFILE")
+    _pl_model=$(jq -r '.model // ""' "$_PRELOADED_PROFILE")
+    _pl_ctx=$(jq -r '.context_length // "65536"' "$_PRELOADED_PROFILE")
+
+    if [[ "${_PRELOADED_ACTION:-open}" == "open" ]]; then
+      echo "" >&2
+      echo "  [ollama] $_pl_model @ ${_pl_host}:${_pl_port}" >&2
+      save_last_session "ollama" "$(basename "$_PRELOADED_PROFILE")" "$_pl_host" "$_pl_model"
+      launch_claude exec "$_pl_model" "$_pl_host" "$_pl_port" "$_pl_ctx" "${passthrough_args[@]}"
+      return
+    fi
+    # Edit: fall through with defaults pre-filled
+  fi
+
+  # --- New session: collect host[:port] (ollama default port 11434) ---
+  local hp_default="${_pl_host:-localhost}${_pl_port:+:$_pl_port}"
+  [[ "$hp_default" == "localhost" ]] && hp_default="localhost:11434"
+  local hp
+  if [[ -n "${remote_host:-}" ]]; then
+    hp="${remote_host}:${_pl_port:-11434}"
+  else
+    hp=$(ask "Ollama endpoint (host or host:port, default port 11434)" "$hp_default")
+  fi
+  if [[ -z "$hp" ]]; then
+    echo "Host is required." >&2
+    exit 1
+  fi
+
+  local o_host o_port
+  if [[ "$hp" == *:* ]]; then
+    o_host="${hp%:*}"
+    o_port="${hp##*:}"
+  else
+    o_host="$hp"
+    o_port="11434"
+  fi
+  local o_url="http://${o_host}:${o_port}"
+
+  # --- Best-effort model picker via /v1/models (single try, short timeout) ---
+  local o_model="${_pl_model:-}"
+  local api_models
+  api_models=$(curl -sf --max-time 2 "${o_url}/v1/models" 2>/dev/null | jq -r '.data[].id // empty' 2>/dev/null | grep -v 'embedding' || true)
+
+  if [[ -n "$api_models" ]]; then
+    echo "" >&2
+    echo "Models on ${o_host}:${o_port}:" >&2
+    echo "" >&2
+    local -a model_list=()
+    local count=0 mid
+    while IFS= read -r mid; do
+      [[ -z "$mid" ]] && continue
+      count=$((count + 1))
+      model_list+=("$mid")
+      printf "  %d) %s\n" "$count" "$mid" >&2
+    done <<< "$api_models"
+    echo "  m) Enter model id manually" >&2
+    echo "" >&2
+    printf "Select (1-%d or m): " "$count" >&2
+    read -r selection
+    if [[ "$selection" == "m" || "$selection" == "M" ]]; then
+      o_model=$(ask "Model id" "$o_model")
+    elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
+      o_model="${model_list[$selection]}"
+    else
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+  else
+    echo "" >&2
+    echo "  (/v1/models unreachable or empty — enter model id manually)" >&2
+    o_model=$(ask "Model id" "$o_model")
+  fi
+
+  if [[ -z "$o_model" ]]; then
+    echo "Model id is required." >&2
+    exit 1
+  fi
+
+  # --- Context window ---
+  local o_ctx
+  o_ctx=$(ask "Context window (tokens)" "${_pl_ctx:-65536}")
+
+  # --- Save profile ---
+  local o_profile="$CONFIG_DIR/ollama-$(slug "${o_host}-${o_model}").json"
+  jq -n \
+    --arg host "$o_host" \
+    --arg port "$o_port" \
+    --arg model "$o_model" \
+    --arg ctx "$o_ctx" \
+    '{host: $host, port: $port, model: $model, context_length: $ctx}' > "$o_profile"
+  echo "" >&2
+  echo "Profile saved: $o_profile" >&2
+
+  save_last_session "ollama" "$(basename "$o_profile")" "$o_host" "$o_model"
+  launch_claude exec "$o_model" "$o_host" "$o_port" "$o_ctx" "${passthrough_args[@]}"
 }
 
 # When sourced for tests (CCLM_LIB_ONLY=1), return here — helpers are defined,
@@ -317,7 +443,7 @@ launch_claude() {
 for f in "$CONFIG_DIR"/*.json(N); do
   _base="${f:t}"
   [[ "$_base" == .* ]] && continue
-  [[ "$_base" == lms-* || "$_base" == llama-* || "$_base" == zai-* || "$_base" == remote-* ]] && continue
+  [[ "$_base" == lms-* || "$_base" == llama-* || "$_base" == zai-* || "$_base" == remote-* || "$_base" == ollama-* ]] && continue
   [[ "$_base" != *-* ]] && continue
   mv "$f" "$CONFIG_DIR/lms-${_base}"
   echo "  [migrate] ${_base} -> lms-${_base}" >&2
@@ -335,6 +461,7 @@ done
 
 backend=""
 remote_host=""
+DRY_RUN=false
 passthrough_args=()
 
 while (( $# )); do
@@ -343,6 +470,8 @@ while (( $# )); do
     --llama)  backend="llama" ;;
     --zai)    backend="zai" ;;
     --remote) backend="remote" ;;
+    --ollama) backend="ollama" ;;
+    --dry-run|--print-env) DRY_RUN=true ;;
     --host)
       [[ $# -ge 2 ]] || { echo "--host requires an argument" >&2; exit 2; }
       remote_host="$2"; shift ;;
@@ -351,6 +480,7 @@ while (( $# )); do
   esac
   shift
 done
+export DRY_RUN
 
 # Load last session state (always returns 0; last_* may be empty on first run).
 load_last_session
@@ -365,7 +495,7 @@ pick_profile() {
   # Globals: _PRELOADED_PROFILE, _PRELOADED_ACTION, backend
 
   local -a profiles
-  profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote}-*.json(N) )
+  profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama}-*.json(N) )
 
   # No saved profiles — skip picker entirely
   (( ${#profiles[@]} == 0 )) && return 1
@@ -383,6 +513,7 @@ pick_profile() {
         lms-*)    be_tag="lms" ;;
         zai-*)    be_tag="zai" ;;
         remote-*) be_tag="remote" ;;
+        ollama-*) be_tag="ollama" ;;
       esac
 
       case "$be_tag" in
@@ -410,6 +541,13 @@ pick_profile() {
           local rh_p=$(jq -r '.host // "?"' "$f")
           local rp_p=$(jq -r '.port // "1234"' "$f")
           host_info="${rh_p}:${rp_p}"
+          ctx_info=$(jq -r '.context_length // "?"' "$f")
+          ;;
+        ollama)
+          model_name=$(jq -r '.model // "?"' "$f")
+          local oh_p=$(jq -r '.host // "?"' "$f")
+          local op_p=$(jq -r '.port // "11434"' "$f")
+          host_info="${oh_p}:${op_p}"
           ctx_info=$(jq -r '.context_length // "?"' "$f")
           ;;
       esac
@@ -445,6 +583,7 @@ pick_profile() {
       lms)    display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
       zai)    display_model=$(jq -r --arg b "$picked_base" '.sonnet_model // $b' "$picked") ;;
       remote) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
+      ollama) display_model=$(jq -r --arg b "$picked_base" '.model // $b' "$picked") ;;
     esac
 
     echo "" >&2
@@ -478,7 +617,7 @@ pick_profile() {
           rm "$picked"
           echo "  Deleted." >&2
           # Refresh list
-          profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote}-*.json(N) )
+          profiles=( "$CONFIG_DIR"/{llama,lms,zai,remote,ollama}-*.json(N) )
           (( ${#profiles[@]} == 0 )) && return 1
         fi
         # Reset counter and re-display
@@ -1860,4 +1999,5 @@ case "$backend" in
   llama)  run_llama ;;
   zai)    run_zai ;;
   remote) run_remote ;;
+  ollama) run_ollama ;;
 esac
